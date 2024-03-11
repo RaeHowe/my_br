@@ -476,7 +476,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		}
 		log.Info("finish removing gc-safepoint keeper")
 	}()
-	err = utils.StartServiceSafePointKeeper(cctx, mgr.GetPDClient(), sp)
+	err = utils.StartServiceSafePointKeeper(cctx, mgr.GetPDClient(), sp) //这里就是定时向pd更新safepoint的过程了:相关链接：https://docs.pingcap.com/zh/tidb/v6.5/br-checkpoint
 	if err != nil {
 		return errors.Trace(err)
 	}

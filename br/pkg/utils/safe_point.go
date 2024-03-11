@@ -51,7 +51,7 @@ func (sp BRServiceSafePoint) MarshalLogObject(encoder zapcore.ObjectEncoder) err
 // getGCSafePoint returns the current gc safe point.
 // TODO: Some cluster may not enable distributed GC.
 func getGCSafePoint(ctx context.Context, pdClient pd.Client) (uint64, error) {
-	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0) //定时更新pd的gc safepoint信息
+	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0) //更新pd的gc safepoint信息
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -68,7 +68,7 @@ func MakeSafePointID() string {
 // Note: It ignores errors other than exceed GC safepoint.
 func CheckGCSafePoint(ctx context.Context, pdClient pd.Client, ts uint64) error {
 	// TODO: use PDClient.GetGCSafePoint instead once PD client exports it.
-	safePoint, err := getGCSafePoint(ctx, pdClient) //从pd获取gc safetime时间（里面会涉及定时向pd更新gc safepoint时间）
+	safePoint, err := getGCSafePoint(ctx, pdClient) //从pd获取gc safetime时间（里面会涉及向pd更新gc safepoint时间）
 	if err != nil {
 		log.Warn("fail to get GC safe point", zap.Error(err))
 		return nil
@@ -94,7 +94,7 @@ func UpdateServiceSafePoint(ctx context.Context, pdClient pd.Client, sp BRServic
 }
 
 // StartServiceSafePointKeeper will run UpdateServiceSafePoint periodicity
-// hence keeping service safepoint won't lose.
+// hence keeping service safepoint won't lose. 将定期运行UpdateServiceSafePoint，因此保持服务安全点不会丢失。
 func StartServiceSafePointKeeper(
 	ctx context.Context,
 	pdClient pd.Client,
@@ -103,11 +103,14 @@ func StartServiceSafePointKeeper(
 	if sp.ID == "" || sp.TTL <= 0 {
 		return errors.Annotatef(berrors.ErrInvalidArgument, "invalid service safe point %v", sp)
 	}
+
+	//继续检查备份时间是否合法
 	if err := CheckGCSafePoint(ctx, pdClient, sp.BackupTS); err != nil {
 		return errors.Trace(err)
 	}
 	// Update service safe point immediately to cover the gap between starting
 	// update goroutine and updating service safe point.
+	//
 	if err := UpdateServiceSafePoint(ctx, pdClient, sp); err != nil {
 		return errors.Trace(err)
 	}
