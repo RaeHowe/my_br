@@ -23,7 +23,6 @@ import (
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
 )
 
-// error definitions
 var (
 	ErrUnknown         = errors.Normalize("unknown error", errors.RFCCodeText("Lightning:Common:ErrUnknown"))
 	ErrInvalidArgument = errors.Normalize("invalid argument", errors.RFCCodeText("Lightning:Common:ErrInvalidArgument"))
@@ -100,8 +99,6 @@ var (
 	ErrTableIsChecksuming   = errors.Normalize("table '%s' is checksuming", errors.RFCCodeText("Lightning:Restore:ErrTableIsChecksuming"))
 	ErrResolveDuplicateRows = errors.Normalize("resolve duplicate rows error on table '%s'", errors.RFCCodeText("Lightning:Restore:ErrResolveDuplicateRows"))
 	ErrFoundDuplicateKeys   = errors.Normalize("found duplicate key '%s', value '%s'", errors.RFCCodeText("Lightning:Restore:ErrFoundDuplicateKey"))
-	ErrAddIndexFailed       = errors.Normalize("add index on table %s failed", errors.RFCCodeText("Lightning:Restore:ErrAddIndexFailed"))
-	ErrDropIndexFailed      = errors.Normalize("drop index %s on table %s failed", errors.RFCCodeText("Lightning:Restore:ErrDropIndexFailed"))
 )
 
 type withStack struct {
@@ -210,7 +207,7 @@ func NormalizeError(err error) error {
 }
 
 // NormalizeOrWrapErr tries to normalize err. If the returned error is ErrUnknown, wraps it with the given rfcErr.
-func NormalizeOrWrapErr(rfcErr *errors.Error, err error, args ...any) error {
+func NormalizeOrWrapErr(rfcErr *errors.Error, err error, args ...interface{}) error {
 	if err == nil {
 		return nil
 	}

@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -37,15 +36,16 @@ import (
 	"github.com/pingcap/tidb/br/pkg/summary"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version"
-	"github.com/pingcap/tidb/pkg/ddl"
-	"github.com/pingcap/tidb/pkg/distsql"
-	"github.com/pingcap/tidb/pkg/kv"
-	"github.com/pingcap/tidb/pkg/meta"
-	"github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/util"
-	"github.com/pingcap/tidb/pkg/util/codec"
-	"github.com/pingcap/tidb/pkg/util/ranger"
-	filter "github.com/pingcap/tidb/pkg/util/table-filter"
+	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/distsql"
+	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/meta/autoid"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/ranger"
+	filter "github.com/pingcap/tidb/util/table-filter"
 	"github.com/tikv/client-go/v2/oracle"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/txnkv/txnlock"
@@ -97,8 +97,8 @@ type Client struct {
 	apiVersion kvrpcpb.APIVersion
 
 	cipher           *backuppb.CipherInfo
-	checkpointMeta   *checkpoint.CheckpointMetadataForBackup
-	checkpointRunner *checkpoint.CheckpointRunner[checkpoint.BackupKeyType, checkpoint.BackupValueType]
+	checkpointMeta   *checkpoint.CheckpointMetadata
+	checkpointRunner *checkpoint.CheckpointRunner
 
 	gcTTL int64
 }
@@ -123,8 +123,8 @@ func (bc *Client) SetCipher(cipher *backuppb.CipherInfo) {
 	bc.cipher = cipher
 }
 
-// GetCurrentTS gets a new timestamp from PD.
-func (bc *Client) GetCurrentTS(ctx context.Context) (uint64, error) {
+// GetTS gets a new timestamp from PD.
+func (bc *Client) GetCurerntTS(ctx context.Context) (uint64, error) {
 	p, l, err := bc.mgr.GetPDClient().GetTS(ctx)
 	if err != nil {
 		return 0, errors.Trace(err)
@@ -134,41 +134,48 @@ func (bc *Client) GetCurrentTS(ctx context.Context) (uint64, error) {
 }
 
 // GetTS returns the latest timestamp.
-func (bc *Client) GetTS(ctx context.Context, duration time.Duration, ts uint64) (uint64, error) {
+func (bc *Client) GetTS(ctx context.Context, duration time.Duration, ts uint64) (uint64, error) { //ctx, cfg.TimeAgo, cfg.BackupTS
 	var (
 		backupTS uint64
 		err      error
 	)
 
+	//如果是断点续传模式
 	if bc.checkpointMeta != nil {
-		log.Info("reuse checkpoint BackupTS", zap.Uint64("backup-ts", bc.checkpointMeta.BackupTS))
+		log.Info("reuse checkpoint BackupTS", zap.Uint64("backup-ts", bc.checkpointMeta.BackupTS)) //就直接复用之前暂停的那个时间作为本次备份的开始时间
 		return bc.checkpointMeta.BackupTS, nil
 	}
+
+	/*
+		如果设置了备份时间的话，就直接使用，下面再检验一下备份时间的合法性即可；如果没有设置备份时间，就从pd获取当前时间（物理+逻辑），如果有time-ago的话，再减去一个time-ago。然后做备份时间校验
+	*/
+
 	if ts > 0 {
 		backupTS = ts
-	} else {
-		p, l, err := bc.mgr.GetPDClient().GetTS(ctx)
+	} else { //如果没有设置快照备份的时间的话
+		p, l, err := bc.mgr.GetPDClient().GetTS(ctx) //获取当前时间（物理时间+逻辑时间）, p 物理时间  l 逻辑时间
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
-		backupTS = oracle.ComposeTS(p, l)
+		backupTS = oracle.ComposeTS(p, l) //把物理时间+逻辑时间转换为unint64的时间 eg: 448303984669097985
 
 		switch {
 		case duration < 0:
 			return 0, errors.Annotate(berrors.ErrInvalidArgument, "negative timeago is not allowed")
-		case duration > 0:
+		case duration > 0: //#######没搞清楚time-ago这个参数的目的是啥########
 			log.Info("backup time ago", zap.Duration("timeago", duration))
 
-			backupTime := oracle.GetTimeFromTS(backupTS)
-			backupAgo := backupTime.Add(-duration)
-			if backupTS < oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) {
+			backupTime := oracle.GetTimeFromTS(backupTS)                       //根据uint64单位的时间获取到标准时间
+			backupAgo := backupTime.Add(-duration)                             //时间之前
+			if backupTS < oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) { //如果备份时间减去一个时间之后发现比原本还大，那就是代表是错的，time-ago输入了一个错误的数据
 				return 0, errors.Annotate(berrors.ErrInvalidArgument, "backup ts overflow please choose a smaller timeago")
 			}
-			backupTS = oracle.ComposeTS(oracle.GetPhysical(backupAgo), l)
+			backupTS = oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) //如果是对的话，就把备份时间设置为time-ago之前的这个时间
 		}
 	}
 
 	// check backup time do not exceed GCSafePoint
+	// 由于备份时间在上面的逻辑中可能被重新设置了，所以这里需要对备份时间进行一定的校验工作：需要保证备份时间不要早于safe-point时间，因为safe-point时间之前的数据是有可能已经被gc掉了
 	err = utils.CheckGCSafePoint(ctx, bc.mgr.GetPDClient(), backupTS)
 	if err != nil {
 		return 0, errors.Trace(err)
@@ -186,11 +193,11 @@ func (bc *Client) SetLockFile(ctx context.Context) error {
 
 // GetSafePointID get the gc-safe-point's service-id from either checkpoint or immediate generation
 func (bc *Client) GetSafePointID() string {
-	if bc.checkpointMeta != nil {
+	if bc.checkpointMeta != nil { //如果是断点续传模式的话，就直接用checkpoint的service id
 		log.Info("reuse the checkpoint gc-safepoint service id", zap.String("service-id", bc.checkpointMeta.GCServiceId))
 		return bc.checkpointMeta.GCServiceId
 	}
-	return utils.MakeSafePointID()
+	return utils.MakeSafePointID() //产生一个br-%s格式的safepoint的id
 }
 
 // SetGCTTL set gcTTL for client.
@@ -228,7 +235,7 @@ func (bc *Client) SetStorageAndCheckNotInUse(
 	}
 
 	// backupmeta already exists
-	exist, err := bc.storage.FileExists(ctx, metautil.MetaFile)
+	exist, err := bc.storage.FileExists(ctx, metautil.MetaFile) //这里需要保证s3备份的路径里面不能存在别的备份的元数据信息
 	if err != nil {
 		return errors.Annotatef(err, "error occurred when checking %s file", metautil.MetaFile)
 	}
@@ -238,22 +245,22 @@ func (bc *Client) SetStorageAndCheckNotInUse(
 			"please specify a correct backup directory!", bc.storage.URI()+"/"+metautil.MetaFile)
 	}
 	// use checkpoint mode if checkpoint meta exists
-	exist, err = bc.storage.FileExists(ctx, checkpoint.CheckpointMetaPathForBackup)
+	exist, err = bc.storage.FileExists(ctx, checkpoint.CheckpointMetaPath) //判断是否存在checkpoint.meta信息（如果存在就代表是断点续传模式）
 	if err != nil {
-		return errors.Annotatef(err, "error occurred when checking %s file", checkpoint.CheckpointMetaPathForBackup)
+		return errors.Annotatef(err, "error occurred when checking %s file", checkpoint.CheckpointMetaPath)
 	}
 
 	// if there is no checkpoint meta, then checkpoint mode is not used
 	// or it is the first execution
-	if exist {
+	if exist { //如果存在的话就代表是个断点续传的模式
 		// load the config's hash to keep the config unchanged.
 		log.Info("load the checkpoint meta, so the existence of lockfile is allowed.")
 		bc.checkpointMeta, err = checkpoint.LoadCheckpointMetadata(ctx, bc.storage)
 		if err != nil {
-			return errors.Annotatef(err, "error occurred when loading %s file", checkpoint.CheckpointMetaPathForBackup)
+			return errors.Annotatef(err, "error occurred when loading %s file", checkpoint.CheckpointMetaPath)
 		}
 	} else {
-		err = CheckBackupStorageIsLocked(ctx, bc.storage)
+		err = CheckBackupStorageIsLocked(ctx, bc.storage) //检查互斥锁，防止把备份写入到其他备份的备份路径中
 		if err != nil {
 			return err
 		}
@@ -277,7 +284,7 @@ func (bc *Client) CheckCheckpoint(hash []byte) error {
 	return nil
 }
 
-func (bc *Client) GetCheckpointRunner() *checkpoint.CheckpointRunner[checkpoint.BackupKeyType, checkpoint.BackupValueType] {
+func (bc *Client) GetCheckpointRunner() *checkpoint.CheckpointRunner {
 	return bc.checkpointRunner
 }
 
@@ -294,7 +301,7 @@ func (bc *Client) StartCheckpointRunner(
 	progressCallBack func(ProgressUnit),
 ) (err error) {
 	if bc.checkpointMeta == nil {
-		bc.checkpointMeta = &checkpoint.CheckpointMetadataForBackup{
+		bc.checkpointMeta = &checkpoint.CheckpointMetadata{
 			GCServiceId: safePointID,
 			ConfigHash:  cfgHash,
 			BackupTS:    backupTS,
@@ -315,13 +322,13 @@ func (bc *Client) StartCheckpointRunner(
 		}
 	}
 
-	bc.checkpointRunner, err = checkpoint.StartCheckpointRunnerForBackup(ctx, bc.storage, bc.cipher, bc.mgr.GetPDClient())
+	bc.checkpointRunner, err = checkpoint.StartCheckpointRunner(ctx, bc.storage, bc.cipher, bc.mgr.GetPDClient())
 	return errors.Trace(err)
 }
 
-func (bc *Client) WaitForFinishCheckpoint(ctx context.Context, flush bool) {
+func (bc *Client) WaitForFinishCheckpoint(ctx context.Context) {
 	if bc.checkpointRunner != nil {
-		bc.checkpointRunner.WaitForFinish(ctx, flush)
+		bc.checkpointRunner.WaitForFinish(ctx)
 	}
 }
 
@@ -359,7 +366,7 @@ func (bc *Client) GetProgressRange(r rtree.Range) (*rtree.ProgressRange, error) 
 func (bc *Client) loadCheckpointRanges(ctx context.Context, progressCallBack func(ProgressUnit)) (map[string]rtree.RangeTree, error) {
 	rangeDataMap := make(map[string]rtree.RangeTree)
 
-	pastDureTime, err := checkpoint.WalkCheckpointFileForBackup(ctx, bc.storage, bc.cipher, func(groupKey string, rg checkpoint.BackupValueType) {
+	pastDureTime, err := checkpoint.WalkCheckpointFile(ctx, bc.storage, bc.cipher, func(groupKey string, rg *rtree.Range) {
 		rangeTree, exists := rangeDataMap[groupKey]
 		if !exists {
 			rangeTree = rtree.NewRangeTree()
@@ -413,9 +420,9 @@ func (bc *Client) BuildBackupRangeAndSchema(
 	isFullBackup bool,
 ) ([]rtree.Range, *Schemas, []*backuppb.PlacementPolicy, error) {
 	if bc.checkpointMeta == nil {
-		return BuildBackupRangeAndInitSchema(storage, tableFilter, backupTS, isFullBackup, true)
+		return BuildBackupRangeAndSchema(storage, tableFilter, backupTS, isFullBackup, true)
 	}
-	_, schemas, policies, err := BuildBackupRangeAndInitSchema(storage, tableFilter, backupTS, isFullBackup, false)
+	_, schemas, policies, err := BuildBackupRangeAndSchema(storage, tableFilter, backupTS, isFullBackup, false)
 	schemas.SetCheckpointChecksum(bc.checkpointMeta.CheckpointChecksum)
 	return bc.checkpointMeta.Ranges, schemas, policies, errors.Trace(err)
 }
@@ -424,7 +431,7 @@ func (bc *Client) BuildBackupRangeAndSchema(
 // which means we found other backup progress already write
 // some data files into the same backup directory or cloud prefix.
 func CheckBackupStorageIsLocked(ctx context.Context, s storage.ExternalStorage) error {
-	exist, err := s.FileExists(ctx, metautil.LockFile)
+	exist, err := s.FileExists(ctx, metautil.LockFile) //这里相当于是个互斥锁，防止这次备份的路径里面包含了别的备份的数据信息
 	if err != nil {
 		return errors.Annotatef(err, "error occurred when checking %s file", metautil.LockFile)
 	}
@@ -472,7 +479,7 @@ func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 	}
 
 	retRanges := make([]kv.KeyRange, 0, 1+len(tbl.Indices))
-	kvRanges, err := distsql.TableHandleRangesToKVRanges(nil, []int64{tblID}, tbl.IsCommonHandle, ranges)
+	kvRanges, err := distsql.TableHandleRangesToKVRanges(nil, []int64{tblID}, tbl.IsCommonHandle, ranges, nil)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -483,7 +490,7 @@ func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 			continue
 		}
 		ranges = ranger.FullRange()
-		idxRanges, err := distsql.IndexRangesToKVRanges(nil, tblID, index.ID, ranges)
+		idxRanges, err := distsql.IndexRangesToKVRanges(nil, tblID, index.ID, ranges, nil)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
@@ -492,10 +499,22 @@ func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 	return retRanges, nil
 }
 
+type mockRequirement struct {
+	kv.Storage
+}
+
+func (r mockRequirement) Store() kv.Storage {
+	return r.Storage
+}
+
+func (r mockRequirement) AutoIDClient() *autoid.ClientDiscover {
+	return nil
+}
+
 // BuildBackupRangeAndSchema gets KV range and schema of tables.
 // KV ranges are separated by Table IDs.
 // Also, KV ranges are separated by Index IDs in the same table.
-func BuildBackupRangeAndInitSchema(
+func BuildBackupRangeAndSchema(
 	storage kv.Storage,
 	tableFilter filter.Filter,
 	backupTS uint64,
@@ -524,7 +543,7 @@ func BuildBackupRangeAndInitSchema(
 	}
 
 	ranges := make([]rtree.Range, 0)
-	schemasNum := 0
+	backupSchemas := NewBackupSchemas()
 	dbs, err := m.ListDatabases()
 	if err != nil {
 		return nil, nil, nil, errors.Trace(err)
@@ -536,81 +555,14 @@ func BuildBackupRangeAndInitSchema(
 			continue
 		}
 
-		hasTable := false
-		err = m.IterTables(dbInfo.ID, func(tableInfo *model.TableInfo) error {
-			if tableInfo.Version > version.CURRENT_BACKUP_SUPPORT_TABLE_INFO_VERSION {
-				// normally this shouldn't happen in a production env.
-				// because we had a unit test to avoid table info version update silencly.
-				// and had version check before run backup.
-				return errors.Errorf("backup doesn't not support table %s with version %d, maybe try a new version of br",
-					tableInfo.Name.String(),
-					tableInfo.Version,
-				)
-			}
-			if !tableFilter.MatchTable(dbInfo.Name.O, tableInfo.Name.O) {
-				// Skip tables other than the given table.
-				return nil
-			}
-
-			schemasNum += 1
-			hasTable = true
-			if buildRange {
-				tableRanges, err := BuildTableRanges(tableInfo)
-				if err != nil {
-					return errors.Trace(err)
-				}
-				for _, r := range tableRanges {
-					// Add keyspace prefix to BackupRequest
-					startKey, endKey := storage.GetCodec().EncodeRange(r.StartKey, r.EndKey)
-					ranges = append(ranges, rtree.Range{
-						StartKey: startKey,
-						EndKey:   endKey,
-					})
-				}
-			}
-
-			return nil
-		})
-
+		tables, err := m.ListTables(dbInfo.ID)
 		if err != nil {
 			return nil, nil, nil, errors.Trace(err)
 		}
 
-		if !hasTable {
+		if len(tables) == 0 {
 			log.Info("backup empty database", zap.Stringer("db", dbInfo.Name))
-			schemasNum += 1
-		}
-	}
-
-	if schemasNum == 0 {
-		log.Info("nothing to backup")
-		return nil, nil, nil, nil
-	}
-	return ranges, NewBackupSchemas(func(storage kv.Storage, fn func(*model.DBInfo, *model.TableInfo)) error {
-		return BuildBackupSchemas(storage, tableFilter, backupTS, isFullBackup, func(dbInfo *model.DBInfo, tableInfo *model.TableInfo) {
-			fn(dbInfo, tableInfo)
-		})
-	}, schemasNum), policies, nil
-}
-
-func BuildBackupSchemas(
-	storage kv.Storage,
-	tableFilter filter.Filter,
-	backupTS uint64,
-	isFullBackup bool,
-	fn func(dbInfo *model.DBInfo, tableInfo *model.TableInfo),
-) error {
-	snapshot := storage.GetSnapshot(kv.NewVersion(backupTS))
-	m := meta.NewSnapshotMeta(snapshot)
-
-	dbs, err := m.ListDatabases()
-	if err != nil {
-		return errors.Trace(err)
-	}
-
-	for _, dbInfo := range dbs {
-		// skip system databases
-		if !tableFilter.MatchSchema(dbInfo.Name.O) || util.IsMemDB(dbInfo.Name.L) || utils.IsTemplateSysDB(dbInfo.Name) {
+			backupSchemas.AddSchema(dbInfo, nil)
 			continue
 		}
 
@@ -620,24 +572,36 @@ func BuildBackupSchemas(
 			dbInfo.PlacementPolicyRef = nil
 		}
 
-		hasTable := false
-		err = m.IterTables(dbInfo.ID, func(tableInfo *model.TableInfo) error {
+		for _, tableInfo := range tables {
+			if tableInfo.Version > version.CURRENT_BACKUP_SUPPORT_TABLE_INFO_VERSION {
+				// normally this shouldn't happen in a production env.
+				// because we had a unit test to avoid table info version update silencly.
+				// and had version check before run backup.
+				return nil, nil, nil, errors.Errorf("backup doesn't not support table %s with version %d, maybe try a new version of br",
+					tableInfo.Name.String(),
+					tableInfo.Version,
+				)
+			}
 			if !tableFilter.MatchTable(dbInfo.Name.O, tableInfo.Name.O) {
 				// Skip tables other than the given table.
-				return nil
+				continue
 			}
 
-			logger := log.L().With(
+			logger := log.With(
 				zap.String("db", dbInfo.Name.O),
 				zap.String("table", tableInfo.Name.O),
 			)
 
 			autoIDAccess := m.GetAutoIDAccessors(dbInfo.ID, tableInfo.ID)
+			tblVer := autoid.AllocOptionTableInfoVersion(tableInfo.Version)
+			idAlloc := autoid.NewAllocator(mockRequirement{storage}, dbInfo.ID, tableInfo.ID, false, autoid.RowIDAllocType, tblVer)
+			seqAlloc := autoid.NewAllocator(mockRequirement{storage}, dbInfo.ID, tableInfo.ID, false, autoid.SequenceType, tblVer)
+			randAlloc := autoid.NewAllocator(mockRequirement{storage}, dbInfo.ID, tableInfo.ID, false, autoid.AutoRandomType, tblVer)
 
 			var globalAutoID int64
 			switch {
 			case tableInfo.IsSequence():
-				globalAutoID, err = autoIDAccess.SequenceValue().Get()
+				globalAutoID, err = seqAlloc.NextGlobalAutoID()
 			case tableInfo.IsView() || !utils.NeedAutoID(tableInfo):
 				// no auto ID for views or table without either rowID nor auto_increment ID.
 			default:
@@ -652,19 +616,21 @@ func BuildBackupSchemas(
 						// so err1 != nil might be expected.
 						if globalAutoID == 0 {
 							// When both auto_increment_id and _rowid are missing, it must be something wrong.
-							return errors.Trace(err1)
+							return nil, nil, nil, errors.Trace(err1)
 						}
 						// Print a warning in other scenes, should it be a INFO log?
 						log.Warn("get rowid error", zap.Error(err1))
 					}
+					// NextGlobalAutoID = globalAutoID  + 1
+					globalAutoID = globalAutoID + 1
 				} else {
-					globalAutoID, err = autoIDAccess.RowID().Get()
+					globalAutoID, err = idAlloc.NextGlobalAutoID()
 				}
 			}
 			if err != nil {
-				return errors.Trace(err)
+				return nil, nil, nil, errors.Trace(err)
 			}
-			tableInfo.AutoIncID = globalAutoID + 1
+			tableInfo.AutoIncID = globalAutoID
 			if !isFullBackup {
 				// according to https://github.com/pingcap/tidb/issues/32290.
 				// ignore placement policy when not in full backup
@@ -677,11 +643,11 @@ func BuildBackupSchemas(
 			if tableInfo.PKIsHandle && tableInfo.ContainsAutoRandomBits() {
 				// this table has auto_random id, we need backup and rebase in restoration
 				var globalAutoRandID int64
-				globalAutoRandID, err = autoIDAccess.RandomID().Get()
+				globalAutoRandID, err = randAlloc.NextGlobalAutoID()
 				if err != nil {
-					return errors.Trace(err)
+					return nil, nil, nil, errors.Trace(err)
 				}
-				tableInfo.AutoRandID = globalAutoRandID + 1
+				tableInfo.AutoRandID = globalAutoRandID
 				logger.Debug("change table AutoRandID",
 					zap.Int64("AutoRandID", globalAutoRandID))
 			}
@@ -698,54 +664,59 @@ func BuildBackupSchemas(
 			}
 			tableInfo.Indices = tableInfo.Indices[:n]
 
-			fn(dbInfo, tableInfo)
-			hasTable = true
+			backupSchemas.AddSchema(dbInfo, tableInfo)
 
-			return nil
-		})
-
-		if err != nil {
-			return errors.Trace(err)
-		}
-
-		if !hasTable {
-			log.Info("backup empty database", zap.Stringer("db", dbInfo.Name))
-			fn(dbInfo, nil)
+			if buildRange {
+				tableRanges, err := BuildTableRanges(tableInfo)
+				if err != nil {
+					return nil, nil, nil, errors.Trace(err)
+				}
+				for _, r := range tableRanges {
+					ranges = append(ranges, rtree.Range{
+						StartKey: r.StartKey,
+						EndKey:   r.EndKey,
+					})
+				}
+			}
 		}
 	}
 
-	return nil
+	if backupSchemas.Len() == 0 {
+		log.Info("nothing to backup")
+		return nil, nil, nil, nil
+	}
+	return ranges, backupSchemas, policies, nil
 }
 
 // BuildFullSchema builds a full backup schemas for databases and tables.
-func BuildFullSchema(storage kv.Storage, backupTS uint64, fn func(dbInfo *model.DBInfo, tableInfo *model.TableInfo)) error {
+func BuildFullSchema(storage kv.Storage, backupTS uint64) (*Schemas, error) {
 	snapshot := storage.GetSnapshot(kv.NewVersion(backupTS))
 	m := meta.NewSnapshotMeta(snapshot)
 
+	newBackupSchemas := NewBackupSchemas()
 	dbs, err := m.ListDatabases()
 	if err != nil {
-		return errors.Trace(err)
+		return nil, errors.Trace(err)
 	}
 
 	for _, db := range dbs {
-		hasTable := false
-		err = m.IterTables(db.ID, func(table *model.TableInfo) error {
-			// add table
-			fn(db, table)
-			hasTable = true
-			return nil
-		})
+		tables, err := m.ListTables(db.ID)
 		if err != nil {
-			return errors.Trace(err)
+			return nil, errors.Trace(err)
 		}
 
 		// backup this empty db if this schema is empty.
-		if !hasTable {
-			fn(db, nil)
+		if len(tables) == 0 {
+			newBackupSchemas.AddSchema(db, nil)
+		}
+
+		for _, table := range tables {
+			// add table
+			newBackupSchemas.AddSchema(db, table)
 		}
 	}
 
-	return nil
+	return newBackupSchemas, nil
 }
 
 func skipUnsupportedDDLJob(job *model.Job) bool {
@@ -788,7 +759,7 @@ func WriteBackupDDLJobs(metaWriter *metautil.MetaWriter, g glue.Glue, store kv.S
 	newestMeta := meta.NewSnapshotMeta(store.GetSnapshot(kv.NewVersion(version.Ver)))
 	allJobs := make([]*model.Job, 0)
 	err = g.UseOneShotSession(store, !needDomain, func(se glue.Session) error {
-		allJobs, err = ddl.GetAllDDLJobs(se.GetSessionCtx())
+		allJobs, err = ddl.GetAllDDLJobs(se.GetSessionCtx(), newestMeta)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -843,7 +814,6 @@ func (bc *Client) BackupRanges(
 	ranges []rtree.Range,
 	request backuppb.BackupRequest,
 	concurrency uint,
-	replicaReadLabel map[string]string,
 	metaWriter *metautil.MetaWriter,
 	progressCallBack func(ProgressUnit),
 ) error {
@@ -873,7 +843,7 @@ func (bc *Client) BackupRanges(
 		}
 		workerPool.ApplyOnErrorGroup(eg, func() error {
 			elctx := logutil.ContextWithField(ectx, logutil.RedactAny("range-sn", id))
-			err := bc.BackupRange(elctx, req, replicaReadLabel, pr, metaWriter, progressCallBack)
+			err := bc.BackupRange(elctx, req, pr, metaWriter, progressCallBack)
 			if err != nil {
 				// The error due to context cancel, stack trace is meaningless, the stack shall be suspended (also clear)
 				if errors.Cause(err) == context.Canceled {
@@ -893,7 +863,6 @@ func (bc *Client) BackupRanges(
 func (bc *Client) BackupRange(
 	ctx context.Context,
 	request backuppb.BackupRequest,
-	replicaReadLabel map[string]string,
 	progressRange *rtree.ProgressRange,
 	metaWriter *metautil.MetaWriter,
 	progressCallBack func(ProgressUnit),
@@ -914,26 +883,10 @@ func (bc *Client) BackupRange(
 		zap.Uint64("rateLimit", request.RateLimit),
 		zap.Uint32("concurrency", request.Concurrency))
 
-	allStores, err := conn.GetAllTiKVStoresWithRetry(ctx, bc.mgr.GetPDClient(), connutil.SkipTiFlash)
+	var allStores []*metapb.Store
+	allStores, err = conn.GetAllTiKVStoresWithRetry(ctx, bc.mgr.GetPDClient(), connutil.SkipTiFlash)
 	if err != nil {
 		return errors.Trace(err)
-	}
-	var targetStores []*metapb.Store
-	targetStoreIds := make(map[uint64]struct{})
-	if len(replicaReadLabel) == 0 {
-		targetStores = allStores // send backup push down request to all stores
-	} else {
-		for _, store := range allStores {
-			for _, label := range store.Labels {
-				if val, ok := replicaReadLabel[label.Key]; ok && val == label.Value {
-					targetStores = append(targetStores, store) // send backup push down request to stores that match replica read label
-					targetStoreIds[store.GetId()] = struct{}{} // record store id for fine grained backup
-				}
-			}
-		}
-	}
-	if len(replicaReadLabel) > 0 && len(targetStores) == 0 {
-		return errors.Errorf("no store matches replica read label: %v", replicaReadLabel)
 	}
 
 	logutil.CL(ctx).Info("backup push down started")
@@ -958,8 +911,8 @@ func (bc *Client) BackupRange(
 			req.EndKey = progressRange.Incomplete[0].EndKey
 		}
 
-		push := newPushDown(bc.mgr, len(targetStores))
-		err = push.pushBackup(ctx, req, progressRange, targetStores, bc.checkpointRunner, progressCallBack)
+		push := newPushDown(bc.mgr, len(allStores))
+		err = push.pushBackup(ctx, req, progressRange, allStores, bc.checkpointRunner, progressCallBack)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -968,7 +921,7 @@ func (bc *Client) BackupRange(
 
 	// Find and backup remaining ranges.
 	// TODO: test fine grained backup.
-	if err := bc.fineGrainedBackup(ctx, request, targetStoreIds, progressRange, progressCallBack); err != nil {
+	if err := bc.fineGrainedBackup(ctx, request, progressRange, progressCallBack); err != nil {
 		return errors.Trace(err)
 	}
 
@@ -1011,104 +964,34 @@ func (bc *Client) BackupRange(
 	return nil
 }
 
-func (bc *Client) FindTargetPeer(ctx context.Context, key []byte, isRawKv bool, targetStoreIds map[uint64]struct{}) (*metapb.Peer, error) {
+func (bc *Client) findRegionLeader(ctx context.Context, key []byte, isRawKv bool) (*metapb.Peer, error) {
 	// Keys are saved in encoded format in TiKV, so the key must be encoded
 	// in order to find the correct region.
-	var leader *metapb.Peer
 	key = codec.EncodeBytesExt([]byte{}, key, isRawKv)
-	state := utils.InitialRetryState(60, 100*time.Millisecond, 2*time.Second)
-	failpoint.Inject("retry-state-on-find-target-peer", func(v failpoint.Value) {
-		logutil.CL(ctx).Info("reset state for FindTargetPeer")
-		state = utils.InitialRetryState(v.(int), 100*time.Millisecond, 100*time.Millisecond)
-	})
-	err := utils.WithRetry(ctx, func() error {
+	for i := 0; i < 5; i++ {
+		// better backoff.
 		region, err := bc.mgr.GetPDClient().GetRegion(ctx, key)
-		failpoint.Inject("return-region-on-find-target-peer", func(v failpoint.Value) {
-			switch v.(string) {
-			case "nil":
-				{
-					region = nil
-				}
-			case "hasLeader":
-				{
-					region = &pd.Region{
-						Leader: &metapb.Peer{
-							Id: 42,
-						},
-					}
-				}
-			case "hasPeer":
-				{
-					region = &pd.Region{
-						Meta: &metapb.Region{
-							Peers: []*metapb.Peer{
-								{
-									Id:      43,
-									StoreId: 42,
-								},
-							},
-						},
-					}
-				}
-
-			case "noLeader":
-				{
-					region = &pd.Region{
-						Leader: nil,
-					}
-				}
-			case "noPeer":
-				{
-					{
-						region = &pd.Region{
-							Meta: &metapb.Region{
-								Peers: nil,
-							},
-						}
-					}
-				}
-			}
-		})
 		if err != nil || region == nil {
-			logutil.CL(ctx).Error("find region failed", zap.Error(err), zap.Reflect("region", region))
-			return errors.Annotate(berrors.ErrPDLeaderNotFound, "cannot find region from pd client")
+			logutil.CL(ctx).Error("find leader failed", zap.Error(err), zap.Reflect("region", region))
+			time.Sleep(time.Millisecond * time.Duration(100*i))
+			continue
 		}
-		if len(targetStoreIds) == 0 {
-			if region.Leader != nil {
-				logutil.CL(ctx).Info("find leader",
-					zap.Reflect("Leader", region.Leader), logutil.Key("key", key))
-				leader = region.Leader
-				return nil
-			}
-		} else {
-			candidates := make([]*metapb.Peer, 0, len(region.Meta.Peers))
-			for _, peer := range region.Meta.Peers {
-				if _, ok := targetStoreIds[peer.StoreId]; ok {
-					candidates = append(candidates, peer)
-				}
-			}
-			if len(candidates) > 0 {
-				peer := candidates[rand.Intn(len(candidates))]
-				logutil.CL(ctx).Info("find target peer for backup",
-					zap.Reflect("Peer", peer), logutil.Key("key", key))
-				leader = peer
-				return nil
-			}
+		if region.Leader != nil {
+			logutil.CL(ctx).Info("find leader",
+				zap.Reflect("Leader", region.Leader), logutil.Key("key", key))
+			return region.Leader, nil
 		}
-		return errors.Annotate(berrors.ErrPDLeaderNotFound, "cannot find leader or candidate from pd client")
-	}, &state)
-	if err != nil {
-		logutil.CL(ctx).Error("can not find a valid target peer after retry", logutil.Key("key", key))
-		return nil, err
+		logutil.CL(ctx).Warn("no region found", logutil.Key("key", key))
+		time.Sleep(time.Millisecond * time.Duration(100*i))
+		continue
 	}
-	// leader cannot be nil if err is nil
-	return leader, nil
+	logutil.CL(ctx).Error("can not find leader", logutil.Key("key", key))
+	return nil, errors.Annotatef(berrors.ErrBackupNoLeader, "can not find leader")
 }
 
 func (bc *Client) fineGrainedBackup(
 	ctx context.Context,
 	req backuppb.BackupRequest,
-	targetStoreIds map[uint64]struct{},
 	pr *rtree.ProgressRange,
 	progressCallBack func(ProgressUnit),
 ) error {
@@ -1155,7 +1038,7 @@ func (bc *Client) fineGrainedBackup(
 				for rg := range retry {
 					subReq := req
 					subReq.StartKey, subReq.EndKey = rg.StartKey, rg.EndKey
-					backoffMs, err := bc.handleFineGrained(ctx, boFork, subReq, targetStoreIds, respCh)
+					backoffMs, err := bc.handleFineGrained(ctx, boFork, subReq, respCh)
 					if err != nil {
 						errCh <- err
 						return
@@ -1197,9 +1080,8 @@ func (bc *Client) fineGrainedBackup(
 					logutil.Key("fine-grained-range-end", resp.EndKey),
 				)
 				if bc.checkpointRunner != nil {
-					if err := checkpoint.AppendForBackup(
+					if err := bc.checkpointRunner.Append(
 						ctx,
-						bc.checkpointRunner,
 						pr.GroupKey,
 						resp.StartKey,
 						resp.EndKey,
@@ -1273,14 +1155,13 @@ func (bc *Client) handleFineGrained(
 	ctx context.Context,
 	bo *tikv.Backoffer,
 	req backuppb.BackupRequest,
-	targetStoreIds map[uint64]struct{},
 	respCh chan<- *backuppb.BackupResponse,
 ) (int, error) {
-	targetPeer, pderr := bc.FindTargetPeer(ctx, req.StartKey, req.IsRawKv, targetStoreIds)
+	leader, pderr := bc.findRegionLeader(ctx, req.StartKey, req.IsRawKv)
 	if pderr != nil {
 		return 0, errors.Trace(pderr)
 	}
-	storeID := targetPeer.GetStoreId()
+	storeID := leader.GetStoreId()
 	lockResolver := bc.mgr.GetLockResolver()
 	client, err := bc.mgr.GetBackupClient(ctx, storeID)
 	if err != nil {
@@ -1437,22 +1318,57 @@ func SendBackup(
 	var errReset error
 	var errBackup error
 
-	retry := -1
-	return utils.WithRetry(ctx, func() error {
-		retry += 1
-		if retry != 0 {
-			client, errReset = resetFn()
-			if errReset != nil {
-				return errors.Annotatef(errReset, "failed to reset backup connection on store:%d "+
-					"please check the tikv status", storeID)
-			}
-		}
-		logutil.CL(ctx).Info("try backup", zap.Int("retry time", retry))
+	for retry := 0; retry < backupRetryTimes; retry++ {
+		logutil.CL(ctx).Info("try backup",
+			zap.Int("retry time", retry),
+		)
 		errBackup = doSendBackup(ctx, client, req, respFn)
 		if errBackup != nil {
+			if isRetryableError(errBackup) {
+				time.Sleep(3 * time.Second)
+				client, errReset = resetFn()
+				if errReset != nil {
+					return errors.Annotatef(errReset, "failed to reset backup connection on store:%d "+
+						"please check the tikv status", storeID)
+				}
+				continue
+			}
+			logutil.CL(ctx).Error("fail to backup", zap.Uint64("StoreID", storeID), zap.Int("retry", retry))
 			return berrors.ErrFailedToConnect.Wrap(errBackup).GenWithStack("failed to create backup stream to store %d", storeID)
 		}
+		// finish backup
+		break
+	}
+	return nil
+}
 
-		return nil
-	}, utils.NewBackupSSTBackoffer())
+// gRPC communication cancelled with connection closing
+const (
+	gRPC_Cancel = "the client connection is closing"
+)
+
+// isRetryableError represents whether we should retry reset grpc connection.
+func isRetryableError(err error) bool {
+	// some errors can be retried
+	// https://github.com/pingcap/tidb/issues/34350
+	switch status.Code(err) {
+	case codes.Unavailable, codes.DeadlineExceeded,
+		codes.ResourceExhausted, codes.Aborted, codes.Internal:
+		{
+			log.Warn("backup met some errors, these errors can be retry 5 times", zap.Error(err))
+			return true
+		}
+	}
+
+	// At least, there are two possible cancel() call,
+	// one from backup range, another from gRPC, here we retry when gRPC cancel with connection closing
+	if status.Code(err) == codes.Canceled {
+		if s, ok := status.FromError(err); ok {
+			if strings.Contains(s.Message(), gRPC_Cancel) {
+				log.Warn("backup met grpc cancel error, this errors can be retry 5 times", zap.Error(err))
+				return true
+			}
+		}
+	}
+	return false
 }

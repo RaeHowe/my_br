@@ -231,7 +231,7 @@ func (p *printByJSON) PrintTasks() {
 			LastErrors:   se,
 		}
 	}
-	mustMarshal := func(i any) string {
+	mustMarshal := func(i interface{}) string {
 		r, err := json.Marshal(i)
 		if err != nil {
 			log.Panic("Failed to marshal a trivial struct to json", zap.Reflect("object", i), zap.Error(err))
@@ -303,9 +303,7 @@ func MaybeQPS(ctx context.Context, mgr PDInfoProvider) (float64, error) {
 			return errors.Annotatef(err, "failed to get count from %s", statusAddr)
 		}
 		elapsed := float64(time.Since(start)) / float64(time.Second)
-		log.Info("calc qps",
-			zap.Uint64("diff", c1-c0), zap.Float64("elapsed", elapsed),
-			zap.Uint64("c0", c0), zap.Uint64("c1", c1))
+		log.Info("calc qps", zap.Uint64("diff", c1-c0), zap.Float64("elapsed", elapsed), zap.Uint64("c0", c0), zap.Uint64("c1", c1))
 
 		qpsMap.Store(s.GetId(), float64(c1-c0)/elapsed)
 		return nil
@@ -321,7 +319,7 @@ func MaybeQPS(ctx context.Context, mgr PDInfoProvider) (float64, error) {
 		log.Warn("failed to get est QPS", logutil.ShortError(err))
 	}
 	qps := 0.0
-	qpsMap.Range(func(key, value any) bool {
+	qpsMap.Range(func(key, value interface{}) bool {
 		qps += value.(float64)
 		return true
 	})

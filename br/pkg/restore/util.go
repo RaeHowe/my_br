@@ -24,9 +24,9 @@ import (
 	"github.com/pingcap/tidb/br/pkg/restore/split"
 	"github.com/pingcap/tidb/br/pkg/rtree"
 	"github.com/pingcap/tidb/br/pkg/utils"
-	"github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/tablecodec"
-	"github.com/pingcap/tidb/pkg/util/codec"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/tablecodec"
+	"github.com/pingcap/tidb/util/codec"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -202,25 +202,7 @@ func GetSSTMetaFromFile(
 	file *backuppb.File,
 	region *metapb.Region,
 	regionRule *import_sstpb.RewriteRule,
-	rewriteMode RewriteMode,
-) (meta *import_sstpb.SSTMeta, err error) {
-	r := *region
-	// If the rewrite mode is for keyspace, then the region bound should be decoded.
-	if rewriteMode == RewriteModeKeyspace {
-		if len(region.GetStartKey()) > 0 {
-			_, r.StartKey, err = codec.DecodeBytes(region.GetStartKey(), nil)
-			if err != nil {
-				return
-			}
-		}
-		if len(region.GetEndKey()) > 0 {
-			_, r.EndKey, err = codec.DecodeBytes(region.GetEndKey(), nil)
-			if err != nil {
-				return
-			}
-		}
-	}
-
+) import_sstpb.SSTMeta {
 	// Get the column family of the file by the file name.
 	var cfName string
 	if strings.Contains(file.GetName(), defaultCFName) {
@@ -232,8 +214,8 @@ func GetSSTMetaFromFile(
 	// Here we rewrites the keys to compare with the keys of the region.
 	rangeStart := regionRule.GetNewKeyPrefix()
 	//  rangeStart = max(rangeStart, region.StartKey)
-	if bytes.Compare(rangeStart, r.GetStartKey()) < 0 {
-		rangeStart = r.GetStartKey()
+	if bytes.Compare(rangeStart, region.GetStartKey()) < 0 {
+		rangeStart = region.GetStartKey()
 	}
 
 	// Append 10 * 0xff to make sure rangeEnd cover all file key
@@ -243,8 +225,8 @@ func GetSSTMetaFromFile(
 	suffix := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 	rangeEnd := append(append([]byte{}, regionRule.GetNewKeyPrefix()...), suffix...)
 	// rangeEnd = min(rangeEnd, region.EndKey)
-	if len(r.GetEndKey()) > 0 && bytes.Compare(rangeEnd, r.GetEndKey()) > 0 {
-		rangeEnd = r.GetEndKey()
+	if len(region.GetEndKey()) > 0 && bytes.Compare(rangeEnd, region.GetEndKey()) > 0 {
+		rangeEnd = region.GetEndKey()
 	}
 
 	if bytes.Compare(rangeStart, rangeEnd) > 0 {
@@ -255,12 +237,11 @@ func GetSSTMetaFromFile(
 	}
 
 	log.Debug("get sstMeta",
-		logutil.Region(region),
 		logutil.File(file),
 		logutil.Key("startKey", rangeStart),
 		logutil.Key("endKey", rangeEnd))
 
-	return &import_sstpb.SSTMeta{
+	return import_sstpb.SSTMeta{
 		Uuid:   id,
 		CfName: cfName,
 		Range: &import_sstpb.Range{
@@ -271,7 +252,7 @@ func GetSSTMetaFromFile(
 		RegionId:    region.GetId(),
 		RegionEpoch: region.GetRegionEpoch(),
 		CipherIv:    file.GetCipherIv(),
-	}, nil
+	}
 }
 
 // makeDBPool makes a session pool with specficated size by sessionFactory.
@@ -511,14 +492,9 @@ func SplitRanges(
 	updateCh glue.Progress,
 	isRawKv bool,
 ) error {
-	splitter := NewRegionSplitter(split.NewSplitClient(
-		client.GetPDClient(),
-		client.pdHTTPClient,
-		client.GetTLSConfig(),
-		isRawKv,
-	))
+	splitter := NewRegionSplitter(split.NewSplitClient(client.GetPDClient(), client.GetTLSConfig(), isRawKv))
 
-	return splitter.ExecuteSplit(ctx, ranges, rewriteRules, client.GetStoreCount(), isRawKv, func(keys [][]byte) {
+	return splitter.Split(ctx, ranges, rewriteRules, isRawKv, func(keys [][]byte) {
 		for range keys {
 			updateCh.Inc()
 		}
@@ -602,7 +578,7 @@ func encodeKeyPrefix(key []byte) []byte {
 
 // ZapTables make zap field of table for debuging, including table names.
 func ZapTables(tables []CreatedTable) zapcore.Field {
-	return logutil.AbbreviatedArray("tables", tables, func(input any) []string {
+	return logutil.AbbreviatedArray("tables", tables, func(input interface{}) []string {
 		tables := input.([]CreatedTable)
 		names := make([]string, 0, len(tables))
 		for _, t := range tables {
@@ -683,7 +659,7 @@ func keyCmp(a, b []byte) int {
 	return chosen
 }
 
-func keyCmpInterface(a, b any) int {
+func keyCmpInterface(a, b interface{}) int {
 	return keyCmp(a.([]byte), b.([]byte))
 }
 
@@ -741,7 +717,7 @@ func CheckConsistencyAndValidPeer(regionInfos []*RecoverRegionInfo) (map[uint64]
 	// Resolve version conflicts.
 	var treeMap = treemap.NewWith(keyCmpInterface)
 	for _, p := range regionInfos {
-		var fk, fv any
+		var fk, fv interface{}
 		fk, _ = treeMap.Ceiling(p.StartKey)
 		// keyspace overlap sk within ceiling - fk
 		if fk != nil && (keyEq(fk.([]byte), p.StartKey) || keyCmp(fk.([]byte), p.EndKey) < 0) {
@@ -821,73 +797,4 @@ func SelectRegionLeader(storeBalanceScore map[uint64]int, peers []*RecoverRegion
 		}
 	}
 	return leader
-}
-
-// each 64 items constitute a bitmap unit
-type bitMap map[int]uint64
-
-func newBitMap() bitMap {
-	return make(map[int]uint64)
-}
-
-func (m bitMap) pos(off int) (blockIndex int, bitOffset uint64) {
-	return off >> 6, uint64(1) << (off & 63)
-}
-
-func (m bitMap) Set(off int) {
-	blockIndex, bitOffset := m.pos(off)
-	m[blockIndex] |= bitOffset
-}
-
-func (m bitMap) Hit(off int) bool {
-	blockIndex, bitOffset := m.pos(off)
-	return (m[blockIndex] & bitOffset) > 0
-}
-
-type fileMap struct {
-	// group index -> bitmap of kv files
-	pos map[int]bitMap
-}
-
-func newFileMap() fileMap {
-	return fileMap{
-		pos: make(map[int]bitMap),
-	}
-}
-
-type LogFilesSkipMap struct {
-	// metadata group key -> group map
-	skipMap map[string]fileMap
-}
-
-func NewLogFilesSkipMap() *LogFilesSkipMap {
-	return &LogFilesSkipMap{
-		skipMap: make(map[string]fileMap),
-	}
-}
-
-func (m *LogFilesSkipMap) Insert(metaKey string, groupOff, fileOff int) {
-	mp, exists := m.skipMap[metaKey]
-	if !exists {
-		mp = newFileMap()
-		m.skipMap[metaKey] = mp
-	}
-	gp, exists := mp.pos[groupOff]
-	if !exists {
-		gp = newBitMap()
-		mp.pos[groupOff] = gp
-	}
-	gp.Set(fileOff)
-}
-
-func (m *LogFilesSkipMap) NeedSkip(metaKey string, groupOff, fileOff int) bool {
-	mp, exists := m.skipMap[metaKey]
-	if !exists {
-		return false
-	}
-	gp, exists := mp.pos[groupOff]
-	if !exists {
-		return false
-	}
-	return gp.Hit(fileOff)
 }

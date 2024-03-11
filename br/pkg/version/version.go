@@ -18,8 +18,9 @@ import (
 	"github.com/pingcap/tidb/br/pkg/logutil"
 	"github.com/pingcap/tidb/br/pkg/utils"
 	"github.com/pingcap/tidb/br/pkg/version/build"
-	"github.com/pingcap/tidb/pkg/parser/model"
-	"github.com/pingcap/tidb/pkg/util/engine"
+	"github.com/pingcap/tidb/parser/model"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/util/engine"
 	pd "github.com/tikv/pd/client"
 	"go.uber.org/zap"
 )
@@ -86,7 +87,7 @@ type VerChecker func(store *metapb.Store, ver *semver.Version) error
 
 // CheckClusterVersion check TiKV version.
 func CheckClusterVersion(ctx context.Context, client pd.Client, checker VerChecker) error {
-	stores, err := client.GetAllStores(ctx, pd.WithExcludeTombstone())
+	stores, err := client.GetAllStores(ctx, pd.WithExcludeTombstone()) //通过pd获取到集群的store信息（不包括tombstone状态的store）
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -105,7 +106,7 @@ func CheckClusterVersion(ctx context.Context, client pd.Client, checker VerCheck
 			continue
 		}
 
-		tikvVersionString := removeVAndHash(s.Version)
+		tikvVersionString := removeVAndHash(s.Version) //通过store获取到版本信息，只拿数字部分，例如: 5.4.0
 		tikvVersion, getVersionErr := semver.NewVersion(tikvVersionString)
 		if getVersionErr != nil {
 			return errors.Annotatef(berrors.ErrVersionMismatch, "%s: TiKV node %s version %s is invalid", getVersionErr, s.Address, tikvVersionString)
@@ -132,9 +133,6 @@ func CheckVersionForBackup(backupVersion *semver.Version) VerChecker {
 // CheckVersionForBRPiTR checks whether version of the cluster and BR-pitr itself is compatible.
 // Note: BR'version >= 6.1.0 at least in this function
 func CheckVersionForBRPiTR(s *metapb.Store, tikvVersion *semver.Version) error {
-	if build.ReleaseVersion == build.ReleaseVersionForTest {
-		return nil
-	}
 	BRVersion, err := semver.NewVersion(removeVAndHash(build.ReleaseVersion))
 	if err != nil {
 		return errors.Annotatef(berrors.ErrVersionMismatch, "%s: invalid version, please recompile using `git fetch origin --tags && make build`", err)
@@ -173,25 +171,15 @@ func CheckVersionForDDL(s *metapb.Store, tikvVersion *semver.Version) error {
 	// use tikvVersion instead of tidbVersion since br doesn't have mysql client to connect tidb.
 	requireVersion := semver.New("6.2.0-alpha")
 	if tikvVersion.Compare(*requireVersion) < 0 {
-		return errors.Errorf("detected the old version of tidb cluster, require: >= 6.2.0, but got %s", tikvVersion.String())
-	}
-	return nil
-}
-
-// CheckVersionForKeyspaceBR checks whether the cluster is support Backup/Restore keyspace data.
-func CheckVersionForKeyspaceBR(_ *metapb.Store, tikvVersion *semver.Version) error {
-	requireVersion := semver.New("6.6.0-alpha")
-	if tikvVersion.Compare(*requireVersion) < 0 {
-		return errors.Errorf("detected the old version of tidb cluster, require: >= 6.6.0, but got %s", tikvVersion.String())
+		log.Info("detected the old version of tidb cluster. set enable concurrent ddl to false")
+		variable.EnableConcurrentDDL.Store(false)
+		return nil
 	}
 	return nil
 }
 
 // CheckVersionForBR checks whether version of the cluster and BR itself is compatible.
 func CheckVersionForBR(s *metapb.Store, tikvVersion *semver.Version) error {
-	if build.ReleaseVersion == build.ReleaseVersionForTest {
-		return nil
-	}
 	BRVersion, err := semver.NewVersion(removeVAndHash(build.ReleaseVersion))
 	if err != nil {
 		return errors.Annotatef(berrors.ErrVersionMismatch, "%s: invalid version, please recompile using `git fetch origin --tags && make build`", err)

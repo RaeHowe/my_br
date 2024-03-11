@@ -24,8 +24,6 @@ const (
 	checkGCSafePointGapTime         = 5 * time.Second
 	// DefaultBRGCSafePointTTL means PD keep safePoint limit at least 5min.
 	DefaultBRGCSafePointTTL = 5 * 60
-	// DefaultCheckpointGCSafePointTTL means PD keep safePoint limit at least 72 minutes.
-	DefaultCheckpointGCSafePointTTL = 72 * 60
 	// DefaultStreamStartSafePointTTL specifies keeping the server safepoint 30 mins when start task.
 	DefaultStreamStartSafePointTTL = 1800
 	// DefaultStreamPauseSafePointTTL specifies Keeping the server safePoint at list 24h when pause task.
@@ -53,7 +51,7 @@ func (sp BRServiceSafePoint) MarshalLogObject(encoder zapcore.ObjectEncoder) err
 // getGCSafePoint returns the current gc safe point.
 // TODO: Some cluster may not enable distributed GC.
 func getGCSafePoint(ctx context.Context, pdClient pd.Client) (uint64, error) {
-	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0)
+	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0) //定时更新pd的gc safepoint信息
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -66,15 +64,16 @@ func MakeSafePointID() string {
 }
 
 // CheckGCSafePoint checks whether the ts is older than GC safepoint.
+// 检查备份时间是否比GC safepoint的时间要早
 // Note: It ignores errors other than exceed GC safepoint.
 func CheckGCSafePoint(ctx context.Context, pdClient pd.Client, ts uint64) error {
 	// TODO: use PDClient.GetGCSafePoint instead once PD client exports it.
-	safePoint, err := getGCSafePoint(ctx, pdClient)
+	safePoint, err := getGCSafePoint(ctx, pdClient) //从pd获取gc safetime时间（里面会涉及定时向pd更新gc safepoint时间）
 	if err != nil {
 		log.Warn("fail to get GC safe point", zap.Error(err))
 		return nil
 	}
-	if ts <= safePoint {
+	if ts <= safePoint { //如果备份时间早于gc safepoint时间的话，报错
 		return errors.Annotatef(berrors.ErrBackupGCSafepointExceeded, "GC safepoint %d exceed TS %d", safePoint, ts)
 	}
 	return nil

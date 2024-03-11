@@ -8,7 +8,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	berrors "github.com/pingcap/tidb/br/pkg/errors"
-	"github.com/pingcap/tidb/pkg/util/engine"
+	"github.com/pingcap/tidb/util/engine"
 	pd "github.com/tikv/pd/client"
 )
 
@@ -45,7 +45,7 @@ func GetAllTiKVStores(
 	storeBehavior StoreBehavior,
 ) ([]*metapb.Store, error) {
 	// get all live stores.
-	stores, err := pdClient.GetAllStores(ctx, pd.WithExcludeTombstone())
+	stores, err := pdClient.GetAllStores(ctx, pd.WithExcludeTombstone()) //通过pd客户端给pd节点发请求获取到集群的store信息（不包括tomestone状态的store和tiflash的store）
 	if err != nil {
 		return nil, errors.Trace(err)
 	}

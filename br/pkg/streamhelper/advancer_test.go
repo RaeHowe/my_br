@@ -16,7 +16,7 @@ import (
 	"github.com/pingcap/tidb/br/pkg/streamhelper"
 	"github.com/pingcap/tidb/br/pkg/streamhelper/config"
 	"github.com/pingcap/tidb/br/pkg/streamhelper/spans"
-	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/kv"
 	"github.com/stretchr/testify/require"
 	"github.com/tikv/client-go/v2/tikv"
 	"github.com/tikv/client-go/v2/txnkv/txnlock"
@@ -188,29 +188,6 @@ func TestOneStoreFailure(t *testing.T) {
 	require.Equal(t, cp, env.checkpoint)
 }
 
-func TestGCServiceSafePoint(t *testing.T) {
-	req := require.New(t)
-	c := createFakeCluster(t, 4, true)
-	ctx := context.Background()
-	c.splitAndScatter("01", "02", "022", "023", "033", "04", "043")
-	env := &testEnv{fakeCluster: c, testCtx: t}
-
-	adv := streamhelper.NewCheckpointAdvancer(env)
-	adv.StartTaskListener(ctx)
-	cp := c.advanceCheckpoints()
-	c.flushAll()
-
-	req.NoError(adv.OnTick(ctx))
-	req.Equal(env.serviceGCSafePoint, cp-1)
-
-	env.unregisterTask()
-	req.Eventually(func() bool {
-		env.fakeCluster.mu.Lock()
-		defer env.fakeCluster.mu.Unlock()
-		return env.serviceGCSafePoint == 0
-	}, 3*time.Second, 100*time.Millisecond)
-}
-
 func TestTaskRanges(t *testing.T) {
 	log.SetLevel(zapcore.DebugLevel)
 	c := createFakeCluster(t, 4, true)
@@ -258,7 +235,7 @@ func TestClearCache(t *testing.T) {
 	c.splitAndScatter("0012", "0034", "0048")
 
 	clearedCache := make(map[uint64]bool)
-	c.onClearCache = func(u uint64) error {
+	c.onGetClient = func(u uint64) error {
 		// make store u cache cleared
 		clearedCache[u] = true
 		return nil
@@ -270,7 +247,7 @@ func TestClearCache(t *testing.T) {
 		s.onGetRegionCheckpoint = func(glftrr *logbackup.GetLastFlushTSOfRegionRequest) error {
 			// mark this store cache cleared
 			failedStoreID = s.GetID()
-			if !hasFailed {
+			if hasFailed {
 				hasFailed = true
 				return errors.New("failed to get checkpoint")
 			}
@@ -287,7 +264,7 @@ func TestClearCache(t *testing.T) {
 	shouldFinishInTime(t, time.Second, "ticking", func() {
 		err = adv.OnTick(ctx)
 	})
-	req.Error(err)
+	req.NoError(err)
 	req.True(failedStoreID > 0, "failed to mark the cluster: ")
 	req.Equal(clearedCache[failedStoreID], true)
 }
@@ -436,30 +413,4 @@ func TestOwnerDropped(t *testing.T) {
 		// Advancer will manually poll the checkpoint...
 		require.Equal(t, vsf.MinValue(), cp)
 	})
-}
-
-// TestRemoveTaskAndFlush tests the bug has been described in #50839.
-func TestRemoveTaskAndFlush(t *testing.T) {
-	log.SetLevel(zapcore.DebugLevel)
-	ctx := context.Background()
-	c := createFakeCluster(t, 4, true)
-	installSubscribeSupport(c)
-	env := &testEnv{
-		fakeCluster: c,
-		testCtx:     t,
-	}
-	adv := streamhelper.NewCheckpointAdvancer(env)
-	adv.StartTaskListener(ctx)
-	adv.SpawnSubscriptionHandler(ctx)
-	require.NoError(t, adv.OnTick(ctx))
-	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/br/pkg/streamhelper/subscription-handler-loop", "pause"))
-	c.flushAll()
-	env.unregisterTask()
-	require.Eventually(t, func() bool {
-		return !adv.HasTask()
-	}, 10*time.Second, 100*time.Millisecond)
-	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/br/pkg/streamhelper/subscription-handler-loop"))
-	require.Eventually(t, func() bool {
-		return !adv.HasSubscribion()
-	}, 10*time.Second, 100*time.Millisecond)
 }
