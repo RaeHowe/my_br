@@ -45,7 +45,7 @@ func GetAllTiKVStores(
 	storeBehavior StoreBehavior,
 ) ([]*metapb.Store, error) {
 	// get all live stores.
-	stores, err := pdClient.GetAllStores(ctx, pd.WithExcludeTombstone())
+	stores, err := pdClient.GetAllStores(ctx, pd.WithExcludeTombstone()) //通过pd客户端给pd节点发请求获取到集群的store信息（不包括tomestone状态的store和tiflash的store）
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -55,7 +55,7 @@ func GetAllTiKVStores(
 	for _, store := range stores {
 		isTiFlash := false
 		if engine.IsTiFlash(store) {
-			if storeBehavior == SkipTiFlash {
+			if storeBehavior == SkipTiFlash { //跳过tiflash
 				continue
 			} else if storeBehavior == ErrorOnTiFlash {
 				return nil, errors.Annotatef(berrors.ErrPDInvalidResponse,

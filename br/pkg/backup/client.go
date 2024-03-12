@@ -140,35 +140,41 @@ func (bc *Client) GetTS(ctx context.Context, duration time.Duration, ts uint64) 
 		err      error
 	)
 
+	//如果是断点续传模式
 	if bc.checkpointMeta != nil {
 		log.Info("reuse checkpoint BackupTS", zap.Uint64("backup-ts", bc.checkpointMeta.BackupTS))
 		return bc.checkpointMeta.BackupTS, nil
 	}
+
+	/*
+		如果设置了备份时间的话，就直接使用，下面再检验一下备份时间的合法性即可；如果没有设置备份时间，就从pd获取当前时间（物理+逻辑），如果有time-ago的话，再减去一个time-ago。然后做备份时间校验
+	*/
 	if ts > 0 {
 		backupTS = ts
-	} else {
-		p, l, err := bc.mgr.GetPDClient().GetTS(ctx)
+	} else { //如果没有设置快照备份的时间的话
+		p, l, err := bc.mgr.GetPDClient().GetTS(ctx) //获取当前时间（物理时间+逻辑时间）, p 物理时间  l 逻辑时间
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
-		backupTS = oracle.ComposeTS(p, l)
+		backupTS = oracle.ComposeTS(p, l) //把物理时间+逻辑时间转换为unint64的时间 eg: 448303984669097985
 
 		switch {
 		case duration < 0:
 			return 0, errors.Annotate(berrors.ErrInvalidArgument, "negative timeago is not allowed")
-		case duration > 0:
+		case duration > 0: //#######没搞清楚time-ago这个参数的目的是啥########
 			log.Info("backup time ago", zap.Duration("timeago", duration))
 
-			backupTime := oracle.GetTimeFromTS(backupTS)
-			backupAgo := backupTime.Add(-duration)
-			if backupTS < oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) {
+			backupTime := oracle.GetTimeFromTS(backupTS)                       //根据uint64单位的时间获取到标准时间
+			backupAgo := backupTime.Add(-duration)                             //时间之前
+			if backupTS < oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) { //如果备份时间减去一个时间之后发现比原本还大，那就是代表是错的，time-ago输入了一个错误的数据
 				return 0, errors.Annotate(berrors.ErrInvalidArgument, "backup ts overflow please choose a smaller timeago")
 			}
-			backupTS = oracle.ComposeTS(oracle.GetPhysical(backupAgo), l)
+			backupTS = oracle.ComposeTS(oracle.GetPhysical(backupAgo), l) //如果是对的话，就把备份时间设置为time-ago之前的这个时间
 		}
 	}
 
 	// check backup time do not exceed GCSafePoint
+	// 由于备份时间在上面的逻辑中可能被重新设置了，所以这里需要对备份时间进行一定的校验工作：需要保证备份时间不要早于safe-point时间，因为safe-point时间之前的数据是有可能已经被gc掉了
 	err = utils.CheckGCSafePoint(ctx, bc.mgr.GetPDClient(), backupTS)
 	if err != nil {
 		return 0, errors.Trace(err)
@@ -186,11 +192,11 @@ func (bc *Client) SetLockFile(ctx context.Context) error {
 
 // GetSafePointID get the gc-safe-point's service-id from either checkpoint or immediate generation
 func (bc *Client) GetSafePointID() string {
-	if bc.checkpointMeta != nil {
+	if bc.checkpointMeta != nil { //如果断点续传的serviceid不为空的话，就用这个id
 		log.Info("reuse the checkpoint gc-safepoint service id", zap.String("service-id", bc.checkpointMeta.GCServiceId))
 		return bc.checkpointMeta.GCServiceId
 	}
-	return utils.MakeSafePointID()
+	return utils.MakeSafePointID() //生成一个br-%s格式的字符串作为safe point ID
 }
 
 // SetGCTTL set gcTTL for client.

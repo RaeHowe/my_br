@@ -16,13 +16,13 @@ import (
 	"github.com/pingcap/tidb/pkg/util/gctuner"
 	"github.com/pingcap/tidb/pkg/util/metricsutil"
 	"github.com/spf13/cobra"
+	"github.com/tiancaiamao/appdash"
 	"go.uber.org/zap"
-	"sourcegraph.com/sourcegraph/appdash"
 )
 
 func runBackupCommand(command *cobra.Command, cmdName string) error {
 	cfg := task.BackupConfig{Config: task.Config{LogProgress: HasLogFile()}}
-	if err := cfg.ParseFromFlags(command.Flags()); err != nil {
+	if err := cfg.ParseFromFlags(command.Flags()); err != nil { //从用户输入的命令解析成具体的br配置
 		command.SilenceUsage = false
 		return errors.Trace(err)
 	}
@@ -38,7 +38,7 @@ func runBackupCommand(command *cobra.Command, cmdName string) error {
 		defer trace.TracerFinishSpan(ctx, store)
 	}
 
-	if cfg.FullBackupType == task.FullBackupTypeEBS {
+	if cfg.FullBackupType == task.FullBackupTypeEBS { //块存储。目前使用aws s3对象存储
 		if err := task.RunBackupEBS(ctx, tidbGlue, &cfg); err != nil {
 			log.Error("failed to backup", zap.Error(err))
 			return errors.Trace(err)
@@ -53,7 +53,7 @@ func runBackupCommand(command *cobra.Command, cmdName string) error {
 	gctuner.GlobalMemoryLimitTuner.DisableAdjustMemoryLimit()
 	defer gctuner.GlobalMemoryLimitTuner.EnableAdjustMemoryLimit()
 
-	if err := task.RunBackup(ctx, tidbGlue, cmdName, &cfg); err != nil {
+	if err := task.RunBackup(ctx, tidbGlue, cmdName, &cfg); err != nil { //具体执行备份逻辑
 		log.Error("failed to backup", zap.Error(err))
 		return errors.Trace(err)
 	}
@@ -124,7 +124,7 @@ func NewBackupCommand() *cobra.Command {
 		},
 	}
 	command.AddCommand(
-		newFullBackupCommand(),
+		newFullBackupCommand(), //全量备份逻辑
 		newDBBackupCommand(),
 		newTableBackupCommand(),
 		newRawBackupCommand(),
@@ -135,7 +135,7 @@ func NewBackupCommand() *cobra.Command {
 	return command
 }
 
-// newFullBackupCommand return a full backup subcommand.
+// newFullBackupCommand return a full backup subcommand. 全量备份
 func newFullBackupCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "full",
@@ -145,7 +145,7 @@ func newFullBackupCommand() *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			// empty db/table means full backup.
-			return runBackupCommand(command, task.FullBackupCmd)
+			return runBackupCommand(command, task.FullBackupCmd) //执行全备命令
 		},
 	}
 	task.DefineFilterFlags(command, acceptAllTables, false)
@@ -153,7 +153,7 @@ func newFullBackupCommand() *cobra.Command {
 	return command
 }
 
-// newDBBackupCommand return a db backup subcommand.
+// newDBBackupCommand return a db backup subcommand.  备份某个库
 func newDBBackupCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "db",
@@ -167,7 +167,7 @@ func newDBBackupCommand() *cobra.Command {
 	return command
 }
 
-// newTableBackupCommand return a table backup subcommand.
+// newTableBackupCommand return a table backup subcommand. 备份某张表
 func newTableBackupCommand() *cobra.Command {
 	command := &cobra.Command{
 		Use:   "table",
@@ -181,7 +181,7 @@ func newTableBackupCommand() *cobra.Command {
 	return command
 }
 
-// newRawBackupCommand return a raw kv range backup subcommand.
+// newRawBackupCommand return a raw kv range backup subcommand.   备份某一行
 func newRawBackupCommand() *cobra.Command {
 	// TODO: remove experimental tag if it's stable
 	command := &cobra.Command{

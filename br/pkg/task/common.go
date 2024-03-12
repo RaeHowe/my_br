@@ -636,6 +636,7 @@ func NewMgr(ctx context.Context,
 		return nil, errors.Annotate(berrors.ErrInvalidArgument, "pd address can not be empty")
 	}
 
+	//安全校验可以忽略
 	securityOption := pd.SecurityOption{}
 	if tlsConfig.IsEnabled() {
 		securityOption.CAPath = tlsConfig.CA

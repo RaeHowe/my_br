@@ -24,7 +24,7 @@ func main() {
 	SetDefaultContext(ctx)
 	rootCmd.AddCommand(
 		NewDebugCommand(),
-		NewBackupCommand(),
+		NewBackupCommand(), //封装备份command对象，并且封装了备份的具体逻辑
 		NewRestoreCommand(),
 		NewStreamCommand(),
 		newOperatorCommand(),

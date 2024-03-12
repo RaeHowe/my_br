@@ -121,7 +121,7 @@ func checkStoresAlive(ctx context.Context,
 
 	liveStoreCount := 0
 	for _, s := range stores {
-		if s.GetState() != metapb.StoreState_Up {
+		if s.GetState() != metapb.StoreState_Up { //如果store的状态为up，liveStoreCount加一
 			continue
 		}
 		liveStoreCount++
@@ -154,11 +154,17 @@ func NewMgr(
 
 	log.Info("new mgr", zap.Strings("pdAddrs", pdAddrs))
 
+	/*
+		创建pd controller
+		pd controller的含义：通过这个controller可以直接对tidb集群中的pd节点进行请求操作。controller结构体内部包含了pd地址、http客户端、集群版本信息
+	*/
 	controller, err := pdutil.NewPdController(ctx, pdAddrs, tlsConf, securityOption)
 	if err != nil {
 		log.Error("failed to create pd controller", zap.Error(err))
 		return nil, errors.Trace(err)
 	}
+
+	//skip下面逻辑
 	if checkRequirements {
 		var checker version.VerChecker
 		switch versionCheckerType {
@@ -176,12 +182,16 @@ func NewMgr(
 		}
 	}
 
+	/*
+		检查集群各个store启动状态（不检查tiflash的store启动情况），这里面不会返回什么对象，只是做一个检查，然后把检查结果作为日志输出
+	*/
 	err = checkStoresAlive(ctx, controller.GetPDClient(), storeBehavior)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 
 	// Disable GC because TiDB enables GC already.
+	// tikv路径：Path example: tikv://etcd-node1:port,etcd-node2:port?cluster=1&disableGC=false
 	path := fmt.Sprintf(
 		"tikv://%s?disableGC=true&keyspaceName=%s",
 		strings.Join(pdAddrs, ","), config.GetGlobalKeyspaceName(),

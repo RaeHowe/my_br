@@ -53,7 +53,7 @@ func (sp BRServiceSafePoint) MarshalLogObject(encoder zapcore.ObjectEncoder) err
 // getGCSafePoint returns the current gc safe point.
 // TODO: Some cluster may not enable distributed GC.
 func getGCSafePoint(ctx context.Context, pdClient pd.Client) (uint64, error) {
-	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0)
+	safePoint, err := pdClient.UpdateGCSafePoint(ctx, 0) //更新pd的gc safepoint信息
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -66,15 +66,16 @@ func MakeSafePointID() string {
 }
 
 // CheckGCSafePoint checks whether the ts is older than GC safepoint.
+// 检查备份时间是否比GC safepoint的时间要早
 // Note: It ignores errors other than exceed GC safepoint.
 func CheckGCSafePoint(ctx context.Context, pdClient pd.Client, ts uint64) error {
 	// TODO: use PDClient.GetGCSafePoint instead once PD client exports it.
-	safePoint, err := getGCSafePoint(ctx, pdClient)
+	safePoint, err := getGCSafePoint(ctx, pdClient) //从pd获取gc safetime时间
 	if err != nil {
 		log.Warn("fail to get GC safe point", zap.Error(err))
 		return nil
 	}
-	if ts <= safePoint {
+	if ts <= safePoint { //如果备份时间早于safepoint时间的话，就报错
 		return errors.Annotatef(berrors.ErrBackupGCSafepointExceeded, "GC safepoint %d exceed TS %d", safePoint, ts)
 	}
 	return nil
@@ -96,6 +97,7 @@ func UpdateServiceSafePoint(ctx context.Context, pdClient pd.Client, sp BRServic
 
 // StartServiceSafePointKeeper will run UpdateServiceSafePoint periodicity
 // hence keeping service safepoint won't lose.
+// 周期性地执行UpdateServiceSafePoint方法去更新pd节点上的gc-safe-point，因此保持safepoint不会丢失。
 func StartServiceSafePointKeeper(
 	ctx context.Context,
 	pdClient pd.Client,
@@ -104,7 +106,7 @@ func StartServiceSafePointKeeper(
 	if sp.ID == "" || sp.TTL <= 0 {
 		return errors.Annotatef(berrors.ErrInvalidArgument, "invalid service safe point %v", sp)
 	}
-	if err := CheckGCSafePoint(ctx, pdClient, sp.BackupTS); err != nil {
+	if err := CheckGCSafePoint(ctx, pdClient, sp.BackupTS); err != nil { //检查备份时间戳是否早于safepoint，如果早的话就会报错
 		return errors.Trace(err)
 	}
 	// Update service safe point immediately to cover the gap between starting

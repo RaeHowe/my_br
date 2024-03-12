@@ -295,14 +295,14 @@ func parseCompressionFlags(flags *pflag.FlagSet) (*CompressionConfig, error) {
 func (cfg *BackupConfig) Adjust() {
 	cfg.adjust()
 	usingDefaultConcurrency := false
-	if cfg.Config.Concurrency == 0 {
+	if cfg.Config.Concurrency == 0 { //并发度
 		cfg.Config.Concurrency = defaultBackupConcurrency
 		usingDefaultConcurrency = true
 	}
 	if cfg.Config.Concurrency > maxBackupConcurrency {
 		cfg.Config.Concurrency = maxBackupConcurrency
 	}
-	if cfg.RateLimit != unlimited {
+	if cfg.RateLimit != unlimited { //备份速率
 		// TiKV limits the upload rate by each backup request.
 		// When the backup requests are sent concurrently,
 		// the ratelimit couldn't work as intended.
@@ -316,7 +316,7 @@ func (cfg *BackupConfig) Adjust() {
 		cfg.Config.Concurrency = 1
 	}
 
-	if cfg.GCTTL == 0 {
+	if cfg.GCTTL == 0 { //备份的gcttl
 		cfg.GCTTL = utils.DefaultBRGCSafePointTTL
 	}
 	// Use zstd as default
@@ -372,24 +372,25 @@ func isFullBackup(cmdName string) bool {
 	return cmdName == FullBackupCmd
 }
 
-// RunBackup starts a backup task inside the current goroutine.
+// RunBackup starts a backup task inside the current goroutine.  在当前的goroutine里面开启一个备份任务
 func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig) error {
-	cfg.Adjust()
+	cfg.Adjust() //调整br默认配置最优化（如果一些配置用户没有传的话，就用默认配置）
 	config.UpdateGlobal(func(conf *config.Config) {
 		conf.KeyspaceName = cfg.KeyspaceName
 	})
 
-	defer summary.Summary(cmdName)
+	defer summary.Summary(cmdName) // cmdName: Full Backup
 	ctx, cancel := context.WithCancel(c)
 	defer cancel()
 
+	//skip 下面逻辑
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("task.RunBackup", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
 		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
 
-	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions)
+	u, err := storage.ParseBackend(cfg.Storage, &cfg.BackendOptions) //备份的外部存储路径解析
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -403,6 +404,8 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	// Domain loads all table info into memory. By skipping Domain, we save
 	// lots of memory (about 500MB for 40K 40 fields YCSB tables).
 	needDomain := !skipStats
+
+	//使用pd对象构建一个管理端，包含了可以直接访问pd的控制器
 	mgr, err := NewMgr(ctx, g, cfg.PD, cfg.TLS, GetKeepalive(&cfg.Config), cfg.CheckRequirements, needDomain, conn.NormalVersionChecker)
 	if err != nil {
 		return errors.Trace(err)
@@ -410,7 +413,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	defer mgr.Close()
 	// after version check, check the cluster whether support checkpoint mode
 	if cfg.UseCheckpoint {
-		err = version.CheckCheckpointSupport()
+		err = version.CheckCheckpointSupport() //如果需要使用断点续传，就进行版本的校验
 		if err != nil {
 			log.Warn("unable to use checkpoint mode, fall back to normal mode", zap.Error(err))
 			cfg.UseCheckpoint = false
@@ -435,6 +438,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		return errors.Trace(err)
 	}
 
+	//获取一个br客户端，br客户端里面包含了访问pd的客户端和集群id等信息
 	client := backup.NewBackupClient(ctx, mgr)
 
 	// set cipher only for checkpoint
@@ -445,11 +449,15 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		SendCredentials:          cfg.SendCreds,
 		CheckS3ObjectLockOptions: true,
 	}
-	if err = client.SetStorageAndCheckNotInUse(ctx, u, &opts); err != nil {
+
+	//====================进行备份文件内容的预校验==================
+
+	if err = client.SetStorageAndCheckNotInUse(ctx, u, &opts); err != nil { //检查s3备份路径内的文件合法性和互斥锁
 		return errors.Trace(err)
 	}
 	// if checkpoint mode is unused at this time but there is checkpoint meta,
 	// CheckCheckpoint will stop backing up
+	//如果本次没有使用断点续传模式，但是s3路径里面存在着checkpoint的meta文件的话，就阻止本次备份 ------------------->
 	cfgHash, err := cfg.Hash()
 	if err != nil {
 		return errors.Trace(err)
@@ -458,24 +466,44 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	if err != nil {
 		return errors.Trace(err)
 	}
+
+	//  <-----------------------------
 	err = client.SetLockFile(ctx)
 	if err != nil {
 		return errors.Trace(err)
 	}
 	// if use checkpoint and gcTTL is the default value
 	// update gcttl to checkpoint's default gc ttl
+
 	if cfg.UseCheckpoint && cfg.GCTTL == utils.DefaultBRGCSafePointTTL {
 		cfg.GCTTL = utils.DefaultCheckpointGCSafePointTTL
 		log.Info("use checkpoint's default GC TTL", zap.Int64("GC TTL", cfg.GCTTL))
 	}
-	client.SetGCTTL(cfg.GCTTL)
+
+	//==================进行时间方面的校验=================
+	client.SetGCTTL(cfg.GCTTL) //设置gcTTL，br会定期去修改pd的saftpoint，防止备份过程中，数据被gc回收掉。
 
 	backupTS, err := client.GetTS(ctx, cfg.TimeAgo, cfg.BackupTS)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	g.Record("BackupTS", backupTS)
-	safePointID := client.GetSafePointID()
+
+	/*
+		// Record implements glue.Glue
+		func (gs *tidbGlue) Record(name string, value uint64) {
+			switch name {
+			case "BackupTS":
+				gs.info.backupTS = value
+			case "RestoreTS":
+				gs.info.restoreTS = value
+			case "Size":
+				gs.info.archiveSize = value
+			}
+		}
+	*/
+
+	g.Record("BackupTS", backupTS)         //gs.info.backupTS = value
+	safePointID := client.GetSafePointID() //获取一个safepoint的id
 	sp := utils.BRServiceSafePoint{
 		BackupTS: backupTS,
 		TTL:      client.GetGCTTL(),
@@ -483,7 +511,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	}
 
 	// use lastBackupTS as safePoint if exists
-	isIncrementalBackup := cfg.LastBackupTS > 0
+	isIncrementalBackup := cfg.LastBackupTS > 0 //判断是否是增量备份，如果是增量备份，就会传LastBackupTS这个参数
 	if isIncrementalBackup {
 		sp.BackupTS = cfg.LastBackupTS
 	}
@@ -509,7 +537,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		}
 		log.Info("finish removing gc-safepoint keeper")
 	}()
-	err = utils.StartServiceSafePointKeeper(cctx, mgr.GetPDClient(), sp)
+	err = utils.StartServiceSafePointKeeper(cctx, mgr.GetPDClient(), sp) //这里就是定时向pd更新safepoint的过程了:相关链接：https://docs.pingcap.com/zh/tidb/v6.5/br-checkpoint
 	if err != nil {
 		return errors.Trace(err)
 	}

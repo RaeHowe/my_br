@@ -184,9 +184,9 @@ func NewPdController(
 	version := parseVersion(versionStr)
 
 	return &PdController{
-		pdClient:  pdClient,
+		pdClient:  pdClient, //pd请求客户端
 		pdHTTPCli: pdHTTPCli,
-		version:   version,
+		version:   version, //集群版本信息
 		// We should make a buffered channel here otherwise when context canceled,
 		// gracefully shutdown will stick at resuming schedulers.
 		schedulerPauseCh: make(chan struct{}, 1),
