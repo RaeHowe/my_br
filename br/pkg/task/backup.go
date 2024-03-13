@@ -537,11 +537,14 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		}
 		log.Info("finish removing gc-safepoint keeper")
 	}()
+
+	//里面起了一个协程，协程里面有两个定时器，定时更新pd的safepoint和定时检查safepoint和备份时间的关系
 	err = utils.StartServiceSafePointKeeper(cctx, mgr.GetPDClient(), sp) //这里就是定时向pd更新safepoint的过程了:相关链接：https://docs.pingcap.com/zh/tidb/v6.5/br-checkpoint
 	if err != nil {
 		return errors.Trace(err)
 	}
 
+	//skip下面逻辑
 	if cfg.RemoveSchedulers {
 		log.Debug("removing some PD schedulers")
 		restore, e := mgr.RemoveSchedulers(ctx)
@@ -559,6 +562,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		}
 	}
 
+	//grpc请求
 	req := backuppb.BackupRequest{
 		ClusterId:        client.GetClusterID(),
 		StartVersion:     cfg.LastBackupTS,

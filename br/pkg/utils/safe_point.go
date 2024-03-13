@@ -82,11 +82,12 @@ func CheckGCSafePoint(ctx context.Context, pdClient pd.Client, ts uint64) error 
 }
 
 // UpdateServiceSafePoint register BackupTS to PD, to lock down BackupTS as safePoint with TTL seconds.
+// 传递BackupTS到pd节点，使用ttl锁定备份时间作为safepoint
 func UpdateServiceSafePoint(ctx context.Context, pdClient pd.Client, sp BRServiceSafePoint) error {
 	log.Debug("update PD safePoint limit with TTL", zap.Object("safePoint", sp))
 
-	lastSafePoint, err := pdClient.UpdateServiceGCSafePoint(ctx, sp.ID, sp.TTL, sp.BackupTS-1)
-	if lastSafePoint > sp.BackupTS-1 {
+	lastSafePoint, err := pdClient.UpdateServiceGCSafePoint(ctx, sp.ID, sp.TTL, sp.BackupTS-1) //更新pd上面的safepoint时间
+	if lastSafePoint > sp.BackupTS-1 {                                                         //如果safepoint晚于备份时间的话，备份失败。因为不能保证数据不被gc
 		log.Warn("service GC safe point lost, we may fail to back up if GC lifetime isn't long enough",
 			zap.Uint64("lastSafePoint", lastSafePoint),
 			zap.Object("safePoint", sp),
@@ -106,19 +107,23 @@ func StartServiceSafePointKeeper(
 	if sp.ID == "" || sp.TTL <= 0 {
 		return errors.Annotatef(berrors.ErrInvalidArgument, "invalid service safe point %v", sp)
 	}
-	if err := CheckGCSafePoint(ctx, pdClient, sp.BackupTS); err != nil { //检查备份时间戳是否早于safepoint，如果早的话就会报错
-		return errors.Trace(err)
-	}
-	// Update service safe point immediately to cover the gap between starting
-	// update goroutine and updating service safe point.
-	if err := UpdateServiceSafePoint(ctx, pdClient, sp); err != nil {
+
+	//检查备份时间戳是否早于safepoint，如果早的话就会报错
+	if err := CheckGCSafePoint(ctx, pdClient, sp.BackupTS); err != nil {
 		return errors.Trace(err)
 	}
 
-	// It would be OK since TTL won't be zero, so gapTime should > `0.
-	updateGapTime := time.Duration(sp.TTL) * time.Second / preUpdateServiceSafePointFactor
+	// Update service safe point immediately to cover the gap between starting
+	// update goroutine and updating service safe point.
+	//立即更新一下safepoint先，为了弥补在启动更新safepoint的goroutine到最终更新pd safepoint的这个时间间隙
+	if err := UpdateServiceSafePoint(ctx, pdClient, sp); err != nil { //更新过程中也会判断备份时间和safepoint时间的关系
+		return errors.Trace(err)
+	}
+
+	// It would be OK since TTL won't be zero, so gapTime should > `0. 这将是OK的，因为TTL不会为零，所以gapTime应该>0。
+	updateGapTime := time.Duration(sp.TTL) * time.Second / preUpdateServiceSafePointFactor //不清楚为啥除以3
 	updateTick := time.NewTicker(updateGapTime)
-	checkTick := time.NewTicker(checkGCSafePointGapTime)
+	checkTick := time.NewTicker(checkGCSafePointGapTime) //五秒
 	go func() {
 		defer updateTick.Stop()
 		defer checkTick.Stop()
@@ -127,6 +132,8 @@ func StartServiceSafePointKeeper(
 			case <-ctx.Done():
 				log.Debug("service safe point keeper exited")
 				return
+
+			// 这里面包含了两个定时器，一个定时器会去定时更新pd节点上面的safepoint时间；另一个定时器会定时检查备份时间和safepoint的关系  ------------------->
 			case <-updateTick.C:
 				if err := UpdateServiceSafePoint(ctx, pdClient, sp); err != nil {
 					log.Warn("failed to update service safe point, backup may fail if gc triggered",
@@ -140,6 +147,8 @@ func StartServiceSafePointKeeper(
 						zap.Object("safePoint", sp),
 					)
 				}
+
+				// <------------------------------------------------
 			}
 		}
 	}()
