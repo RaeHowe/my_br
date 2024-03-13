@@ -411,16 +411,20 @@ func (bc *Client) SetApiVersion(v kvrpcpb.APIVersion) {
 }
 
 // Client.BuildBackupRangeAndSchema calls BuildBackupRangeAndSchema,
-// if the checkpoint mode is used, return the ranges from checkpoint meta
+// if the checkpoint mode is used, return the ranges from checkpoint meta 如果使用了断点续传模式，就从checkpoint的元数据返回需要备份数据的】range信息
 func (bc *Client) BuildBackupRangeAndSchema(
-	storage kv.Storage,
+	storage kv.Storage, //SI隔离级别
 	tableFilter filter.Filter,
 	backupTS uint64,
 	isFullBackup bool,
 ) ([]rtree.Range, *Schemas, []*backuppb.PlacementPolicy, error) {
 	if bc.checkpointMeta == nil {
+		//普通快照备份
+		//#########先看这里逻辑##########
 		return BuildBackupRangeAndInitSchema(storage, tableFilter, backupTS, isFullBackup, true)
 	}
+
+	//断点续传恢复备份
 	_, schemas, policies, err := BuildBackupRangeAndInitSchema(storage, tableFilter, backupTS, isFullBackup, false)
 	schemas.SetCheckpointChecksum(bc.checkpointMeta.CheckpointChecksum)
 	return bc.checkpointMeta.Ranges, schemas, policies, errors.Trace(err)
@@ -501,6 +505,16 @@ func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 // BuildBackupRangeAndSchema gets KV range and schema of tables.
 // KV ranges are separated by Table IDs.
 // Also, KV ranges are separated by Index IDs in the same table.
+// 获取到table的数据kv范围信息和schema元数据信息。因为tidb数据是kv存储，key里面包含了数据所属的table id信息，所以直接根据table id就
+// 可以获取到属于这个表的数据信息。
+// 此外，KV范围由同一表中的索引id分隔:
+// 唯一索引&主键(非聚簇表):
+// Key: tablePrefix{TableID}_indexPrefixSep{indexID}_indexedColumnsValue
+// Value: Rowid
+//
+// 二级索引:
+// Key: tablePrefix{TableID}_indexPrefixSep{indexID}_indexedColumnsValue_{RowID}
+// Value: null
 func BuildBackupRangeAndInitSchema(
 	storage kv.Storage,
 	tableFilter filter.Filter,
@@ -508,6 +522,10 @@ func BuildBackupRangeAndInitSchema(
 	isFullBackup bool,
 	buildRange bool,
 ) ([]rtree.Range, *Schemas, []*backuppb.PlacementPolicy, error) {
+	/*
+		先定义个kv的version信息  （todo：需要确认是不是mvcc方面的版本信息）
+		然后通过kv的version信息去获取数据快照，相当于进行一个快照读的过程，构建一个read view出来
+	*/
 	snapshot := storage.GetSnapshot(kv.NewVersion(backupTS))
 	m := meta.NewSnapshotMeta(snapshot)
 

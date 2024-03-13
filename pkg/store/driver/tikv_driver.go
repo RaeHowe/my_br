@@ -369,6 +369,8 @@ func (s *tikvStore) Begin(opts ...tikv.TxnOption) (kv.Transaction, error) {
 
 // GetSnapshot gets a snapshot that is able to read any data which data is <= ver.
 // if ver is MaxVersion or > current max committed version, we will use current version for this snapshot.
+// 通过ver版本参数去获取到可以读取到的kv数据信息(可以读取到的数据的版本信息是应该小于ver的)。如果ver是最大版本或者ver大于数据库里面kv数据当前
+// 已提交的最大版本的话，那么就直接使用数据的当前版本
 func (s *tikvStore) GetSnapshot(ver kv.Version) kv.Snapshot {
 	return txn_driver.NewSnapshot(s.KVStore.GetSnapshot(ver.Ver))
 }

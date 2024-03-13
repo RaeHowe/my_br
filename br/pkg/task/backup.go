@@ -578,15 +578,17 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 			ResourceControlContext: &kvrpcpb.ResourceControlContext{
 				ResourceGroupName: "", // TODO,
 			},
-			RequestSource: kvutil.BuildRequestSource(true, kv.InternalTxnBR, kvutil.ExplicitTypeBR),
+			RequestSource: kvutil.BuildRequestSource(true, kv.InternalTxnBR, kvutil.ExplicitTypeBR), // br
 		},
 	}
-	brVersion := g.GetVersion()
-	clusterVersion, err := mgr.GetClusterVersion(ctx)
+
+	brVersion := g.GetVersion()                       //获取到br版本
+	clusterVersion, err := mgr.GetClusterVersion(ctx) //获取到tidb集群版本信息
 	if err != nil {
 		return errors.Trace(err)
 	}
 
+	//感觉这块就是到tikv去收集需要备份的数据集合和表集合
 	ranges, schemas, policies, err := client.BuildBackupRangeAndSchema(mgr.GetStorage(), cfg.TableFilter, backupTS, isFullBackup(cmdName))
 	if err != nil {
 		return errors.Trace(err)
