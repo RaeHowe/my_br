@@ -952,9 +952,10 @@ func (m *Meta) UpdateTable(dbID int64, tableInfo *model.TableInfo) error {
 }
 
 // IterTables iterates all the table at once, in order to avoid oom.
+// 一次迭代所有的表，以避免oom
 func (m *Meta) IterTables(dbID int64, fn func(info *model.TableInfo) error) error {
 	dbKey := m.dbKey(dbID)
-	if err := m.checkDBExists(dbKey); err != nil {
+	if err := m.checkDBExists(dbKey); err != nil { //检查库是否存在
 		return errors.Trace(err)
 	}
 

@@ -426,7 +426,7 @@ const (
 	// _tidb_rowid allocator when AUTO_ID_CACHE is 1. This version is introduced to preserve the compatibility of old tables:
 	// the tables with version <= TableInfoVersion4 still use a single allocator for auto_increment and _tidb_rowid.
 	// Also see https://github.com/pingcap/tidb/issues/982.
-	TableInfoVersion5 = uint16(5)
+	【TableInfoVersion5 = uint16(5)
 
 	// CurrLatestTableInfoVersion means the latest table info in the current TiDB.
 	CurrLatestTableInfoVersion = TableInfoVersion5
@@ -441,7 +441,7 @@ var ExtraPartitionIdName = NewCIStr("_tidb_pid") //nolint:revive
 // ExtraPhysTblIdName is the name of ExtraPhysTblID Column.
 var ExtraPhysTblIdName = NewCIStr("_tidb_tid") //nolint:revive
 
-// TableInfo provides meta data describing a DB table.
+// TableInfo provides meta data describing a DB table. 表的元数据信息
 type TableInfo struct {
 	ID      int64  `json:"id"`
 	Name    CIStr  `json:"name"`
@@ -457,6 +457,7 @@ type TableInfo struct {
 	PKIsHandle bool `json:"pk_is_handle"`
 	// IsCommonHandle is true when clustered index feature is
 	// enabled and the primary key is not a single integer column.
+	// 如果集群开启了聚簇索引并且主键不是integer类型
 	IsCommonHandle bool `json:"is_common_handle"`
 	// CommonHandleVersion is the version of the clustered index.
 	// 0 for the clustered index created == 5.0.0 RC.
@@ -715,8 +716,8 @@ func (tr *TiFlashReplicaInfo) IsPartitionAvailable(pid int64) bool {
 
 // GetPartitionInfo returns the partition information.
 func (t *TableInfo) GetPartitionInfo() *PartitionInfo {
-	if t.Partition != nil && t.Partition.Enable {
-		return t.Partition
+	if t.Partition != nil && t.Partition.Enable { //这里判断表是否是分区表
+		return t.Partition //返回分区表的分区信息
 	}
 	return nil
 }

@@ -239,6 +239,7 @@ func (p *PdController) GetClusterVersion(ctx context.Context) (string, error) {
 }
 
 // GetRegionCount returns the region count in the specified range.
+// 返回数据范围内的region数量
 func (p *PdController) GetRegionCount(ctx context.Context, startKey, endKey []byte) (int, error) {
 	// TiKV reports region start/end keys to PD in memcomparable-format.
 	var start, end []byte

@@ -167,6 +167,7 @@ func (t *TxStructure) HGetAll(key []byte) ([]HashPair, error) {
 }
 
 // HGetIter iterates all the fields and values in hash.
+// 迭代表里面所有的字段
 func (t *TxStructure) HGetIter(key []byte, fn func(pair HashPair) error) error {
 	return t.iterateHash(key, func(field []byte, value []byte) error {
 		pair := HashPair{

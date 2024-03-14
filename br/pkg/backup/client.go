@@ -455,10 +455,11 @@ func CheckBackupStorageIsLocked(ctx context.Context, s storage.ExternalStorage) 
 
 // BuildTableRanges returns the key ranges encompassing the entire table,
 // and its partitions if exists.
+// 返回包含整个表及其分区(如果存在)的key范围
 func BuildTableRanges(tbl *model.TableInfo) ([]kv.KeyRange, error) {
-	pis := tbl.GetPartitionInfo()
-	if pis == nil {
-		// Short path, no partition.
+	pis := tbl.GetPartitionInfo() //获取到表的分区信息（如果这个表是分区表的话）
+	if pis == nil {               //如果pis为空代表这个表不是分区表
+		// Short path, no partition. //不是分区表
 		return appendRanges(tbl, tbl.ID)
 	}
 
@@ -475,17 +476,18 @@ func BuildTableRanges(tbl *model.TableInfo) ([]kv.KeyRange, error) {
 
 func appendRanges(tbl *model.TableInfo, tblID int64) ([]kv.KeyRange, error) {
 	var ranges []*ranger.Range
-	if tbl.IsCommonHandle {
-		ranges = ranger.FullNotNullRange()
+	if tbl.IsCommonHandle { //聚簇索引判断
+		ranges = ranger.FullNotNullRange() //扫描数据的低水位和高水位就是负无穷到正无穷
 	} else {
-		ranges = ranger.FullIntRange(false)
+		ranges = ranger.FullIntRange(false) //扫描数据的低水位和高水位是：MinInt64  和MaxInt64 整型类型
 	}
 
-	retRanges := make([]kv.KeyRange, 0, 1+len(tbl.Indices))
-	kvRanges, err := distsql.TableHandleRangesToKVRanges(nil, []int64{tblID}, tbl.IsCommonHandle, ranges)
+	retRanges := make([]kv.KeyRange, 0, 1+len(tbl.Indices))                                               //索引信息
+	kvRanges, err := distsql.TableHandleRangesToKVRanges(nil, []int64{tblID}, tbl.IsCommonHandle, ranges) //里面对startkey和endkey进行编码操作，通过编码完的key信息到tikv去拿数据
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+
 	retRanges = kvRanges.AppendSelfTo(retRanges)
 
 	for _, index := range tbl.Indices {
@@ -549,11 +551,11 @@ func BuildBackupRangeAndInitSchema(
 	//		Name:DBname\x00tablename -> tableID
 	// }
 
-	var policies []*backuppb.PlacementPolicy
+	var policies []*backuppb.PlacementPolicy //grpc请求
 	if isFullBackup {
 		// according to https://github.com/pingcap/tidb/issues/32290
 		// only full backup will record policies in backupMeta.
-		policyList, err := m.ListPolicies()
+		policyList, err := m.ListPolicies() //获取元数据的placement police信息（region调度信息）
 		if err != nil {
 			return nil, nil, nil, errors.Trace(err)
 		}
@@ -569,7 +571,7 @@ func BuildBackupRangeAndInitSchema(
 
 	ranges := make([]rtree.Range, 0)
 	schemasNum := 0
-	dbs, err := m.ListDatabases()
+	dbs, err := m.ListDatabases() //获取到需要备份的所有数据库信息
 	if err != nil {
 		return nil, nil, nil, errors.Trace(err)
 	}
@@ -598,8 +600,8 @@ func BuildBackupRangeAndInitSchema(
 
 			schemasNum += 1
 			hasTable = true
-			if buildRange {
-				tableRanges, err := BuildTableRanges(tableInfo)
+			if buildRange { //全量备份是true
+				tableRanges, err := BuildTableRanges(tableInfo) //这一步还没有到tikv拿数据，里面的逻辑是定义好到tikv存储引擎中扫描数据的数据范围是怎样的
 				if err != nil {
 					return errors.Trace(err)
 				}
@@ -882,6 +884,13 @@ func WriteBackupDDLJobs(metaWriter *metautil.MetaWriter, g glue.Glue, store kv.S
 }
 
 // BackupRanges make a backup of the given key ranges.
+/*
+	ranges:备份数据的范围
+	Concurrency：备份并发度
+	ReplicaReadLabel：是否进行follower读
+	metawriter：元数据信息写入器
+	progressCallBack：备份进度回调函数
+*/
 func (bc *Client) BackupRanges(
 	ctx context.Context,
 	ranges []rtree.Range,
@@ -892,7 +901,7 @@ func (bc *Client) BackupRanges(
 	progressCallBack func(ProgressUnit),
 ) error {
 	log.Info("Backup Ranges Started", rtree.ZapRanges(ranges))
-	init := time.Now()
+	init := time.Now() //备份开始时间
 
 	defer func() {
 		log.Info("Backup Ranges Completed", zap.Duration("take", time.Since(init)))
@@ -905,7 +914,7 @@ func (bc *Client) BackupRanges(
 	}
 
 	// we collect all files in a single goroutine to avoid thread safety issues.
-	workerPool := utils.NewWorkerPool(concurrency, "Ranges")
+	workerPool := utils.NewWorkerPool(concurrency, "Ranges") //并发度决定了workerpool里面worker的数量
 	eg, ectx := errgroup.WithContext(ctx)
 	for id, r := range ranges {
 		id := id

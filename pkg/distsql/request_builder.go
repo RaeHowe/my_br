@@ -439,7 +439,7 @@ func (builder *RequestBuilder) SetConnIDAndConnAlias(connID uint64, connAlias st
 // TableHandleRangesToKVRanges convert table handle ranges to "KeyRanges" for multiple tables.
 func TableHandleRangesToKVRanges(sc *stmtctx.StatementContext, tid []int64, isCommonHandle bool, ranges []*ranger.Range) (*kv.KeyRanges, error) {
 	if !isCommonHandle {
-		return tablesRangesToKVRanges(tid, ranges), nil
+		return tablesRangesToKVRanges(tid, ranges), nil //非聚簇索引扫描方式
 	}
 	return CommonHandleRangesToKVRanges(sc, tid, ranges)
 }
@@ -462,7 +462,7 @@ func tablesRangesToKVRanges(tids []int64, ranges []*ranger.Range) *kv.KeyRanges 
 func tableRangesToKVRangesWithoutSplit(tids []int64, ranges []*ranger.Range) *kv.KeyRanges {
 	krs := make([][]kv.KeyRange, len(tids))
 	for i := range krs {
-		krs[i] = make([]kv.KeyRange, 0, len(ranges))
+		krs[i] = make([]kv.KeyRange, 0, len(ranges)) //二维数组初始化构建过程
 	}
 	for _, ran := range ranges {
 		low, high := encodeHandleKey(ran)

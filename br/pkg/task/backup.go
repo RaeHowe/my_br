@@ -588,7 +588,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		return errors.Trace(err)
 	}
 
-	//感觉这块就是到tikv去收集需要备份的数据集合和表集合
+	//这块就是构建需要备份的数据集合和表集合, 返回的ranges对象代表了要到tikv存储引擎中扫描拿取哪些数据（是个范围）
 	ranges, schemas, policies, err := client.BuildBackupRangeAndSchema(mgr.GetStorage(), cfg.TableFilter, backupTS, isFullBackup(cmdName))
 	if err != nil {
 		return errors.Trace(err)
@@ -609,7 +609,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		m.ApiVersion = mgr.GetStorage().GetCodec().GetAPIVersion()
 	})
 
-	log.Info("get placement policies", zap.Int("count", len(policies)))
+	log.Info("get placement policies", zap.Int("count", len(policies))) //获取到placement policies信息
 	if len(policies) != 0 {
 		metawriter.Update(func(m *backuppb.BackupMeta) {
 			m.Policies = policies
@@ -630,10 +630,13 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	}
 
 	if isIncrementalBackup {
-		if backupTS <= cfg.LastBackupTS {
+		//增量备份
+		if backupTS <= cfg.LastBackupTS { //这个校验很简单，备份的开始时间不能早于或者等于增量备份的开始时间
 			log.Error("LastBackupTS is larger or equal to current TS")
 			return errors.Annotate(berrors.ErrInvalidArgument, "LastBackupTS is larger or equal to current TS")
 		}
+
+		//增量备份的开始时间不能早于safepoint时间
 		err = utils.CheckGCSafePoint(ctx, mgr.GetPDClient(), cfg.LastBackupTS)
 		if err != nil {
 			log.Error("Check gc safepoint for last backup ts failed", zap.Error(err))
@@ -653,14 +656,15 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 	summary.CollectInt("backup total ranges", len(ranges))
 
 	var updateCh glue.Progress
-	var unit backup.ProgressUnit
-	if len(ranges) < 100 {
-		unit = backup.RegionUnit
+	var unit backup.ProgressUnit //备份进度的单位
+
+	if len(ranges) < 100 { //如果range的数量小于100的话，就用region作为备份进度单位
+		unit = backup.RegionUnit // region
 		// The number of regions need to backup
 		approximateRegions := 0
 		for _, r := range ranges {
 			var regionCount int
-			regionCount, err = mgr.GetRegionCount(ctx, r.StartKey, r.EndKey)
+			regionCount, err = mgr.GetRegionCount(ctx, r.StartKey, r.EndKey) // **** 这块会通过tikv-client，根据数据的startKey和endKey去获取这个范围内的region数量
 			if err != nil {
 				return errors.Trace(err)
 			}
@@ -669,14 +673,17 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		// Redirect to log if there is no log file to avoid unreadable output.
 		updateCh = g.StartProgress(
 			ctx, cmdName, int64(approximateRegions), !cfg.LogProgress)
+
 		summary.CollectInt("backup total regions", approximateRegions)
 	} else {
+		//range大于100个，数据太多了的话，就用range作为备份单位
 		unit = backup.RangeUnit
 		// To reduce the costs, we can use the range as unit of progress.
 		updateCh = g.StartProgress(
 			ctx, cmdName, int64(len(ranges)), !cfg.LogProgress)
 	}
 
+	//这里是设置一个回调函数，在备份的过程中，动态调用这个回调函数，去实时地记录备份的进度
 	progressCount := uint64(0)
 	progressCallBack := func(callBackUnit backup.ProgressUnit) {
 		if unit == callBackUnit {
@@ -699,6 +706,7 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		}
 	}
 
+	//先不看断点续传备份
 	if cfg.UseCheckpoint {
 		if err = client.StartCheckpointRunner(ctx, cfgHash, backupTS, ranges, safePointID, progressCallBack); err != nil {
 			return errors.Trace(err)
@@ -734,7 +742,17 @@ func RunBackup(c context.Context, g glue.Glue, cmdName string, cfg *BackupConfig
 		time.Sleep(5 * time.Second)
 	})
 
+	//写入备份数据的元数据信息
 	metawriter.StartWriteMetasAsync(ctx, metautil.AppendDataFile)
+
+	//BackupRanges最后的参数就是上面的回调函数
+	/*
+		ranges:备份数据的范围
+		Concurrency：备份并发度
+		ReplicaReadLabel：是否进行follower读
+		metawriter：元数据信息写入器
+		progressCallBack：备份进度回调函数
+	*/
 	err = client.BackupRanges(ctx, ranges, req, uint(cfg.Concurrency), cfg.ReplicaReadLabel, metawriter, progressCallBack)
 	if err != nil {
 		return errors.Trace(err)

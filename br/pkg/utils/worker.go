@@ -29,9 +29,9 @@ type identifiedTaskFunc func(uint64)
 
 // NewWorkerPool returns a WorkPool.
 func NewWorkerPool(limit uint, name string) *WorkerPool {
-	workers := make(chan *Worker, limit)
+	workers := make(chan *Worker, limit) //缓冲channel，里面可以同时启动多少个worker
 	for i := uint(0); i < limit; i++ {
-		workers <- &Worker{ID: uint64(i + 1)}
+		workers <- &Worker{ID: uint64(i + 1)} //不断地往channel里面加worker
 	}
 	return &WorkerPool{
 		limit:   limit,

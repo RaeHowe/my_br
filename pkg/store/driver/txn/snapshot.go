@@ -90,7 +90,7 @@ func (s *tikvSnapshot) IterReverse(k kv.Key, lowerBound kv.Key) (kv.Iterator, er
 func (s *tikvSnapshot) SetOption(opt int, val any) {
 	switch opt {
 	case kv.IsolationLevel:
-		level := getTiKVIsolationLevel(val.(kv.IsoLevel))
+		level := getTiKVIsolationLevel(val.(kv.IsoLevel)) //默认SI隔离级别
 		s.KVSnapshot.SetIsolationLevel(level)
 	case kv.Priority:
 		s.KVSnapshot.SetPriority(getTiKVPriority(val.(int)))

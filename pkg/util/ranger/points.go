@@ -198,10 +198,13 @@ func getNotNullFullRange() []*point {
 
 // FullIntRange is used for table range. Since table range cannot accept MaxValueDatum as the max value.
 // So we need to set it to MaxInt64.
+// FullIntRange 被用来表range。因为table range不能接收MaxValueDatum数据类型来设置最大值.所以我们需要直接设置它为常量MaxInt64
 func FullIntRange(isUnsigned bool) Ranges {
 	if isUnsigned {
 		return Ranges{{LowVal: []types.Datum{types.NewUintDatum(0)}, HighVal: []types.Datum{types.NewUintDatum(math.MaxUint64)}, Collators: collate.GetBinaryCollatorSlice(1)}}
 	}
+
+	//逻辑到这里
 	return Ranges{{LowVal: []types.Datum{types.NewIntDatum(math.MinInt64)}, HighVal: []types.Datum{types.NewIntDatum(math.MaxInt64)}, Collators: collate.GetBinaryCollatorSlice(1)}}
 }
 
