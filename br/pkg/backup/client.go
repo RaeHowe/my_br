@@ -527,7 +527,27 @@ func BuildBackupRangeAndInitSchema(
 		然后通过kv的version信息去获取数据快照，相当于进行一个快照读的过程，构建一个read view出来
 	*/
 	snapshot := storage.GetSnapshot(kv.NewVersion(backupTS))
+
 	m := meta.NewSnapshotMeta(snapshot)
+	//构建一下要做备份的数据快照的元数据信息，格式是：
+	//Meta structure:
+	//	NextGlobalID -> int64
+	//	SchemaVersion -> int64
+	//	DBs -> {
+	//		DB:1 -> db meta data []byte
+	//		DB:2 -> db meta data []byte
+	//	}
+	//	DB:1 -> {
+	//		Table:1 -> table meta data []byte
+	//		Table:2 -> table meta data []byte
+	//		TID:1 -> int64
+	//		TID:2 -> int64
+	//	}
+	//
+	// DDL version 2
+	// Names -> {
+	//		Name:DBname\x00tablename -> tableID
+	// }
 
 	var policies []*backuppb.PlacementPolicy
 	if isFullBackup {
